@@ -1,0 +1,53 @@
+{
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "X-Frame-Options", "value": "DENY" },
+        { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" },
+        { "key": "Strict-Transport-Security", "value": "max-age=31536000; includeSubDomains; preload" },
+        { "key": "Permissions-Policy", "value": "camera=(), microphone=(), geolocation=()" }
+      ]
+    },
+    {
+      "source": "/assets/(.*)\\.js",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=300, must-revalidate" }
+      ]
+    },
+    {
+      "source": "/assets/(.*)\\.css",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=300, must-revalidate" }
+      ]
+    },
+    {
+      "source": "/assets/(.*)\\.ico",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }
+      ]
+    }
+  ],
+  "redirects": [
+    { "source": "/login", "destination": "https://dashboard.storytrackr.app/login", "permanent": false },
+    { "source": "/signup", "destination": "https://dashboard.storytrackr.app/signup", "permanent": false },
+    { "source": "/demo", "destination": "https://dashboard.storytrackr.app/demo", "permanent": false }
+  ],
+  "rewrites": [
+    { "source": "/assets/:path*", "destination": "/assets/:path*" },
+    { "source": "/features", "destination": "/features.html" },
+    { "source": "/features/", "destination": "/features.html" },
+    { "source": "/pricing", "destination": "/pricing.html" },
+    { "source": "/pricing/", "destination": "/pricing.html" },
+    { "source": "/security", "destination": "/security.html" },
+    { "source": "/security/", "destination": "/security.html" },
+    { "source": "/support", "destination": "/support.html" },
+    { "source": "/support/", "destination": "/support.html" },
+    { "source": "/privacy", "destination": "/privacy.html" },
+    { "source": "/privacy/", "destination": "/privacy.html" },
+    { "source": "/terms", "destination": "/terms.html" },
+    { "source": "/terms/", "destination": "/terms.html" },
+    { "source": "/:path*", "destination": "/index.html" }
+  ]
+}

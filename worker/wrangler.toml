@@ -1,0 +1,28 @@
+name = "storytrackr-worker"
+main = "src/worker.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[kv_namespaces]]
+binding = "ST_KV"
+id = "b1cda5b3dde9466db0c7edf37cc7d6af"
+preview_id = "b1cda5b3dde9466db0c7edf37cc7d6af"
+
+[[r2_buckets]]
+binding = "ST_R2"
+bucket_name = "storytrackr-media"
+
+# ── Secrets (set in Cloudflare Dashboard → Workers → storytrackr-worker → Settings → Variables) ──
+#
+#   ADMIN_EMAIL          Your email address (bootstraps first admin account)
+#   SESSION_SECRET       Any random 32+ character string
+#   DEMO_TENANT_ID       Set to:  demo
+#   MAILCHANNELS_FROM    noreply@storytrackr.app
+#
+# ── Cloudflare Resources to create (see DEPLOY.md or the instructions below) ──
+#
+#   KV Namespace:   name = "storytrackr-kv"   → paste the ID above
+#   R2 Bucket:      name = "storytrackr-media"
+#
+# ── Worker Route (set in Dashboard after deploying) ──
+#   dashboard.storytrackr.app/api/*  →  storytrackr-worker
