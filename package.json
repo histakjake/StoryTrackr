@@ -1,14 +1,19 @@
 {
   "name": "storytrackr",
-  "private": true,
+  "version": "1.0.0",
+  "description": "StoryTrackr — student relationship tracker for youth workers",
   "type": "module",
+  "main": "server/index.js",
   "scripts": {
-    "build": "node scripts/build.mjs",
-    "dev": "npm run build && node scripts/dev.mjs",
-    "check": "node --check api/[...route].js",
-    "test": "node --test test/*.test.mjs"
+    "dev": "node server/index.js",
+    "start": "node server/index.js",
+    "test": "node --test test/smoke.test.mjs"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.57.2"
+    "@supabase/supabase-js": "^2.39.0"
+  },
+  "devDependencies": {},
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
