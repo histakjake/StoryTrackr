@@ -19,6 +19,22 @@ const ROOT      = path.join(__dirname, '..');
 const PUBLIC    = path.join(ROOT, 'public');
 const ASSETS    = path.join(ROOT, 'app', 'assets');
 
+// ─── Load .env if present (dev convenience — no external deps required) ──
+
+try {
+  const envPath = new URL('../.env', import.meta.url);
+  const lines = fs.readFileSync(fileURLToPath(envPath), 'utf8').split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq < 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const val = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, '');
+    if (key && !(key in process.env)) process.env[key] = val;
+  }
+} catch (_) { /* .env absent — rely on real env vars */ }
+
 // ─── Environment ────────────────────────────────────────────────────────
 
 const env = {
@@ -60,7 +76,16 @@ const server = http.createServer(async (req, res) => {
 
   // API routes
   if (pathname.startsWith('/api/')) {
-    return routeRequest(req, res, env);
+    try {
+      await routeRequest(req, res, env);
+    } catch (err) {
+      console.error('[server] Unhandled error for', pathname, err);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Internal server error' }));
+      }
+    }
+    return;
   }
 
   // Static assets

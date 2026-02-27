@@ -142,6 +142,16 @@ describe('POST /api/auth/logout', () => {
   });
 });
 
+describe('GET /api/health', () => {
+  it('returns 200 with ok:true', async () => {
+    const { status, json } = await req('GET', '/api/health');
+    assert.equal(status, 200);
+    assert.equal(json.ok, true);
+    assert.ok('supabaseUrl' in json, 'should include supabaseUrl status');
+    assert.ok('supabaseKey' in json, 'should include supabaseKey status');
+  });
+});
+
 describe('404 fallthrough', () => {
   it('unknown routes return 404', async () => {
     const { status } = await req('GET', '/api/does-not-exist');
