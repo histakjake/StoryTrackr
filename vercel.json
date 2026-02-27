@@ -1,10 +1,4 @@
 {
-  "crons": [
-    {
-      "path": "/api/cron/attendance",
-      "schedule": "0 6 * * *"
-    }
-  ],
   "headers": [
     {
       "source": "/(.*)",
@@ -18,29 +12,16 @@
     },
     {
       "source": "/assets/(.*)\\.js",
-      "headers": [
-        { "key": "Cache-Control", "value": "public, max-age=300, must-revalidate" }
-      ]
+      "headers": [{ "key": "Cache-Control", "value": "public, max-age=300, must-revalidate" }]
     },
     {
       "source": "/assets/(.*)\\.css",
-      "headers": [
-        { "key": "Cache-Control", "value": "public, max-age=300, must-revalidate" }
-      ]
-    },
-    {
-      "source": "/assets/(.*)\\.(png|ico)",
-      "headers": [
-        { "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }
-      ]
+      "headers": [{ "key": "Cache-Control", "value": "public, max-age=300, must-revalidate" }]
     }
   ],
   "rewrites": [
     { "source": "/api/:path*", "destination": "/api/:path*" },
-    { "source": "/manifest.json", "destination": "/api/manifest" },
-    { "source": "/favicon.ico", "destination": "/assets/favicon.ico" },
-    { "source": "/icon-192.png", "destination": "/assets/icon-192.png" },
-    { "source": "/icon-512.png", "destination": "/assets/icon-512.png" },
+    { "source": "/assets/:path*", "destination": "/app/assets/:path*" },
     { "source": "/:path*", "destination": "/index.html" }
   ]
 }
