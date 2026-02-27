@@ -1,2595 +1,687 @@
-/* ── StoryTrackr App SPA ── */
+/**
+ * app/assets/app.js — StoryTrackr frontend
+ *
+ * Calls the following API endpoints:
+ *   POST /api/auth/login          - leader email/password login
+ *   POST /api/auth/logout         - logout
+ *   POST /api/auth/passcode       - quick-view passcode login
+ *   GET  /api/sheet/read          - load full roster
+ *   POST /api/sheet/write?action= - add | update | delete student
+ *   POST /api/demo-session        - redeem demo token (auto-enter from ?demo=TOKEN)
+ *
+ * P2 fixes applied:
+ *   - Loading state shown while roster fetches
+ *   - Catch blocks surface errors via showToast (no silent failures)
+ *   - Demo auto-login from ?demo= query param
+ *   - Forgot password link wired to Supabase reset flow (via /api/auth/reset)
+ *   - Empty roster state shows a helpful message
+ *   - Error toasts dismiss after 6 s (vs 3 s for success)
+ *   - Field-level validation highlights invalid inputs
+ *   - Confirmation message shown after password reset email sent
+ */
+
 'use strict';
 
-// ── State ─────────────────────────────────────────────────────
-const state = {
-  user:      null,
-  isDemoMode: false,
-  roster:    null,   // { hs: { core:[], loose:[], fringe:[] }, ms:{...} }
-  activity:  null,
-  notifications: null,
-  settings:  null,
-  loading:   true,
-  navOpen:   false,
+// ── State ──────────────────────────────────────────────────────────────────
+
+const STATE = {
+  roster: {
+    hs: { core: [], loose: [], fringe: [] },
+    ms: { core: [], loose: [], fringe: [] },
+  },
+  currentSchool: 'hs',
+  session:  null,   // { orgId, role, readonly }
+  editingId: null,  // student id being edited (null = add)
+  canEdit:  false,
 };
 
-// ── API helper ────────────────────────────────────────────────
-async function api(method, path, body) {
-  const opts = {
-    method,
+// ── DOM refs ───────────────────────────────────────────────────────────────
+
+const $ = id => document.getElementById(id);
+
+const els = {
+  loader:           $('loader'),
+  loginGate:        $('login-gate'),
+  app:              $('app'),
+
+  // Login
+  loginForm:        $('login-form'),
+  loginEmail:       $('login-email'),
+  loginPassword:    $('login-password'),
+  loginBtn:         $('login-btn'),
+  errEmail:         $('err-email'),
+  errPassword:      $('err-password'),
+  forgotBtn:        $('forgot-btn'),
+  resetSent:        $('reset-sent'),
+
+  passcodeForm:     $('passcode-form'),
+  passcodeInput:    $('passcode-input'),
+  passcodeBtn:      $('passcode-btn'),
+  errPasscode:      $('err-passcode'),
+
+  // App
+  readonlyBadge:    $('readonly-badge'),
+  userEmail:        $('user-email'),
+  logoutBtn:        $('logout-btn'),
+  addStudentBtn:    $('add-student-btn'),
+  rosterLoader:     $('roster-loader'),
+  rosterGrid:       $('roster-grid'),
+
+  // Student form modal
+  studentModal:     $('student-modal'),
+  studentModalTitle: $('student-modal-title'),
+  studentModalClose: $('student-modal-close'),
+  studentModalCancel: $('student-modal-cancel'),
+  studentForm:      $('student-form'),
+  sfName:           $('sf-name'),
+  sfGrade:          $('sf-grade'),
+  sfSchool:         $('sf-school'),
+  sfSk:             $('sf-sk'),
+  sfSection:        $('sf-section'),
+  sfBirthday:       $('sf-birthday'),
+  sfGoal:           $('sf-goal'),
+  errSfName:        $('err-sf-name'),
+  studentFormSubmit: $('student-form-submit'),
+
+  // Detail modal
+  detailModal:      $('detail-modal'),
+  detailModalTitle: $('detail-modal-title'),
+  detailModalClose: $('detail-modal-close'),
+  detailContent:    $('detail-content'),
+  detailFooter:     $('detail-footer'),
+};
+
+// ── Toast ─────────────────────────────────────────────────────────────────
+
+function showToast(message, type = 'info') {
+  const container = $('toast-container');
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = message;
+  container.appendChild(el);
+
+  // Error toasts stay longer so users can read them (P2 fix)
+  const delay = type === 'error' ? 6000 : 3000;
+  setTimeout(() => el.remove(), delay);
+}
+
+// ── API helpers ───────────────────────────────────────────────────────────
+
+async function apiFetch(url, options = {}) {
+  const res = await fetch(url, {
     credentials: 'include',
-    headers: {},
-  };
-  if (body !== undefined) {
-    opts.headers['Content-Type'] = 'application/json';
-    opts.body = JSON.stringify(body);
-  }
-  const res = await fetch(`/api/${path}`, opts);
-  const ct  = res.headers.get('Content-Type') || '';
-  if (ct.includes('application/json')) return res.json();
-  return { ok: res.ok, status: res.status };
+    headers: { 'Content-Type': 'application/json', ...(options.headers ?? {}) },
+    ...options,
+  });
+  return res;
 }
 
-// ── Router ────────────────────────────────────────────────────
-function getRoute() {
-  return window.location.pathname || '/';
+// ── Auth ──────────────────────────────────────────────────────────────────
+
+async function tryLeaderLogin(email, password) {
+  const res = await apiFetch('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email, password }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error ?? 'Login failed');
+  return data;
 }
 
-function navigate(path, replace = false) {
-  if (replace) history.replaceState({}, '', path);
-  else         history.pushState({}, '', path);
-  render();
+async function tryPasscodeLogin(passcode) {
+  const res = await apiFetch('/api/auth/passcode', {
+    method: 'POST',
+    body: JSON.stringify({ passcode }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error ?? 'Wrong passcode');
+  return data;
 }
 
-window.addEventListener('popstate', render);
-
-// ── Root render ───────────────────────────────────────────────
-async function render() {
-  const path = getRoute();
-
-  // Public routes (no auth needed)
-  if (path === '/login')          return renderLogin();
-  if (path === '/signup')         return renderSignup();
-  if (path === '/forgot-password')return renderForgotPassword();
-  if (path === '/reset-password') return renderResetPassword();
-
-  // Demo init route
-  if (path === '/demo') return renderDemoInit();
-
-  // Require auth for all other routes
-  if (!state.user) {
-    await loadUser();
-    if (!state.user) return navigate('/login', true);
-  }
-
-  // Route to views
-  if (path === '/select-org')         return renderSelectOrg();
-  if (path === '/onboarding')         return renderOnboarding();
-  if (path === '/dashboard' || path === '/') return renderStudentsView();
-  if (path.startsWith('/students'))   return renderStudentsView();
-  if (path === '/attendance')         return renderAttendance();
-  if (path === '/notes')              return renderNotes();
-  if (path === '/settings')           return renderSettings();
-  if (path === '/billing')            return renderBilling();
-  if (path === '/brain-dump')         return renderBrainDump();
-  if (path === '/adminland' || path === '/admin-land' || path === '/admin') return renderAdminLand();
-  if (path === '/owner')              return renderOwnerDashboard();
-
-  navigate('/students', true);
+async function tryDemoLogin(token) {
+  const res = await apiFetch('/api/demo-session', {
+    method: 'POST',
+    body: JSON.stringify({ token }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error ?? 'Invalid demo token');
+  return data;
 }
 
-// ── Load current user ─────────────────────────────────────────
-async function loadUser() {
+async function doLogout() {
   try {
-    const data = await api('GET', 'me');
-    state.user      = data.user || null;
-    state.isDemoMode = !!data.isDemoMode;
-    if (state.user?.preferences) applyTheme(state.user.preferences);
-  } catch (_) {
-    state.user = null;
+    await apiFetch('/api/auth/logout', { method: 'POST' });
+  } catch (err) {
+    // P2 fix: never silently swallow logout errors
+    showToast('Logout failed. Please try again.', 'error');
+    throw err;
   }
 }
 
-async function loadNotifications(force = false) {
-  if (!state.user || state.isDemoMode) {
-    state.notifications = [];
-    return [];
-  }
-  if (!force && Array.isArray(state.notifications)) return state.notifications;
+// ── Roster loading ────────────────────────────────────────────────────────
+
+async function loadRoster() {
+  // P2 fix: show loading spinner before fetch
+  els.rosterLoader.classList.remove('hidden');
+  els.rosterGrid.innerHTML = '';
+
   try {
-    const data = await api('GET', 'notifications');
-    state.notifications = data.notifications || [];
-  } catch (_) {
-    state.notifications = [];
+    const res = await apiFetch('/api/sheet/read');
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error ?? `HTTP ${res.status}`);
+    }
+    const roster = await res.json();
+    STATE.roster = roster;
+    renderRoster();
+  } catch (err) {
+    // P2 fix: surface errors instead of silent catch
+    showToast(`Failed to load roster: ${err.message}`, 'error');
+    renderEmptyState('Could not load roster. Check your connection.');
+  } finally {
+    els.rosterLoader.classList.add('hidden');
   }
-  return state.notifications;
 }
 
-function unreadNotificationsCount() {
-  return (state.notifications || []).filter(n => !n.read_at).length;
-}
+// ── Roster rendering ─────────────────────────────────────────────────────────
 
-// ── App shell ─────────────────────────────────────────────────
-function appShell(content, activePage) {
-  const u = state.user;
-  const initials = u?.name ? u.name.split(' ').map(n => n[0]).join('').slice(0,2).toUpperCase() : '?';
+function renderRoster() {
+  const sk   = STATE.currentSchool;
+  const data = STATE.roster[sk] ?? { core: [], loose: [], fringe: [] };
 
-  return `
-    <div class="app-layout">
-      ${state.isDemoMode ? `
-        <div class="demo-banner">
-          🎭 Demo mode (read-only) — <a href="https://storytrackr.app/signup">Start free trial</a>
-        </div>` : ''}
-      <header class="app-header">
-        <span class="app-header-logo">StoryTrackr</span>
-        <nav class="app-header-nav">
-          ${navBtn('students','👥 Students', activePage)}
-          ${navBtn('attendance','✅ Attendance', activePage)}
-          ${navBtn('notes','📝 Notes', activePage)}
-          ${navBtn('brain-dump','🧠 Brain Dump', activePage)}
-          ${navBtn('settings','⚙️ Settings', activePage)}
-          ${u?.role === 'admin' || u?.orgRole === 'admin' ? navBtn('adminland','🏛️ AdminLand', activePage) : ''}
-        </nav>
-        <div class="header-actions">
-          <button class="avatar-btn" onclick="toggleUserMenu(this, event)" title="${u?.name || 'Profile'}">${initials}</button>
-        </div>
-      </header>
-      <main class="app-main" id="main-content">
-        ${content}
-      </main>
-      <nav class="bottom-nav">
-        ${mobileNavBtn('students','students','👥')}
-        ${mobileNavBtn('attendance','attendance','✅')}
-        ${mobileNavBtn('notes','notes','📝')}
-        ${mobileNavBtn('brain-dump','brain-dump','🧠')}
-        ${mobileNavBtn('settings','settings','⚙️')}
-        ${u?.role === 'admin' || u?.orgRole === 'admin' ? mobileNavBtn('adminland','adminland','🏛️') : ''}
-      </nav>
-      <div id="toast-container" class="toast-container"></div>
-    </div>`;
-}
+  const total = (data.core?.length ?? 0) + (data.loose?.length ?? 0) + (data.fringe?.length ?? 0);
 
-function navBtn(page, label, active) {
-  return `<button class="header-nav-btn ${active === page ? 'active' : ''}" onclick="navigate('/${page}')">${label}</button>`;
-}
-function mobileNavBtn(page, key, icon) {
-  const active = getRoute().startsWith('/' + key) || (key === 'dashboard' && getRoute() === '/');
-  return `<button class="bottom-nav-btn ${active ? 'active' : ''}" onclick="navigate('/${page}')">${icon}<span>${page.charAt(0).toUpperCase()+page.slice(1)}</span></button>`;
-}
-
-// ── User menu ─────────────────────────────────────────────────
-window.toggleUserMenu = function(btn, e) {
-  e.stopPropagation();
-  const existing = document.getElementById('user-menu');
-  if (existing) { existing.remove(); return; }
-  const menu = document.createElement('div');
-  menu.id = 'user-menu';
-  menu.style.cssText = `position:fixed;top:52px;right:12px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:.5rem;min-width:180px;z-index:100;box-shadow:var(--shadow)`;
-  const u = state.user;
-  menu.innerHTML = `
-    <div style="padding:.6rem .8rem .4rem;border-bottom:1px solid var(--border);margin-bottom:.4rem">
-      <div style="font-weight:600;font-size:.9rem">${esc(u?.name||'')}</div>
-      <div style="font-size:.8rem;color:var(--muted)">${esc(u?.email||'Demo')}</div>
-      <div style="margin-top:.3rem">${roleBadge(u?.role)}</div>
-    </div>
-    <button class="btn btn-ghost btn-sm w-full" style="justify-content:flex-start" onclick="navigate('/settings')">⚙️ Settings</button>
-    ${!state.isDemoMode ? `<button class="btn btn-ghost btn-sm w-full" style="justify-content:flex-start" onclick="navigate('/billing')">💳 Billing</button>` : ''}
-    <hr class="divider">
-    ${state.isDemoMode
-      ? `<a class="btn btn-primary btn-sm w-full" href="https://storytrackr.app/signup">Start Free Trial</a>`
-      : `<button class="btn btn-ghost btn-sm w-full" style="justify-content:flex-start;color:var(--red)" onclick="doLogout()">↩ Log out</button>`}
-  `;
-  document.body.appendChild(menu);
-  document.addEventListener('click', () => menu.remove(), { once: true });
-};
-
-function roleBadge(role) {
-  const map = { admin: 'badge-purple', leader: 'badge-blue', approved: 'badge-green', demo: 'badge-yellow' };
-  return `<span class="badge ${map[role]||'badge-gray'}">${role||'user'}</span>`;
-}
-
-// ── Toast ─────────────────────────────────────────────────────
-function toast(msg, type = 'info', ms = 3000) {
-  const c = document.getElementById('toast-container');
-  if (!c) return;
-  const t = document.createElement('div');
-  t.className = `toast toast-${type}`;
-  t.textContent = msg;
-  c.appendChild(t);
-  setTimeout(() => t.remove(), ms);
-}
-
-// ── Demo guard ────────────────────────────────────────────────
-function demoBlock(action) {
-  if (state.isDemoMode) { toast('Demo is read-only', 'error'); return true; }
-  return false;
-}
-
-// ── Logout ────────────────────────────────────────────────────
-window.doLogout = async function() {
-  await api('POST', 'auth/logout');
-  state.user = null;
-  state.roster = null;
-  state.activity = null;
-  state.notifications = null;
-  state.settings = null;
-  navigate('/login', true);
-};
-
-// ── Escape helper ─────────────────────────────────────────────
-function esc(s) {
-  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-function mount(html) {
-  document.getElementById('root').innerHTML = html;
-}
-
-// ═══════════════════════════════════════════════════════════════
-// AUTH VIEWS
-// ═══════════════════════════════════════════════════════════════
-
-function renderLogin() {
-  const params = new URLSearchParams(window.location.search);
-  const notice = params.get('notice');
-  mount(`
-    <div class="auth-page">
-      <div class="auth-card card card-body">
-        <div class="auth-logo">StoryTrackr</div>
-        ${notice === 'reset-ok' ? `<div style="background:#14532d;color:#86efac;padding:.75rem;border-radius:var(--radius-sm);font-size:.875rem;margin-bottom:1rem">Password reset — please log in.</div>` : ''}
-        <h1 class="auth-title">Welcome back</h1>
-        <p class="auth-sub">Sign in to your account</p>
-        <form class="form-stack" id="login-form">
-          <div class="form-group">
-            <label class="form-label">Email</label>
-            <input class="form-input" type="email" name="email" placeholder="you@example.com" required autocomplete="email">
-          </div>
-          <div class="form-group">
-            <label class="form-label">Password</label>
-            <input class="form-input" type="password" name="password" placeholder="••••••••••" required autocomplete="current-password">
-          </div>
-          <div id="login-error" class="form-error hidden"></div>
-          <button class="btn btn-primary btn-full" type="submit" id="login-btn">Sign in</button>
-        </form>
-        <div class="auth-footer">
-          <a href="/forgot-password" onclick="navigate('/forgot-password');return false;">Forgot password?</a>
-          &nbsp;·&nbsp;
-          <a href="/signup" onclick="navigate('/signup');return false;">Create account</a>
-        </div>
-        <hr class="divider">
-        <div style="text-align:center">
-          <button class="btn btn-secondary btn-sm" onclick="startDemo()">Try Demo instead</button>
-        </div>
-      </div>
-    </div>
-  `);
-
-  document.getElementById('login-form').addEventListener('submit', async e => {
-    e.preventDefault();
-    const btn = document.getElementById('login-btn');
-    const err = document.getElementById('login-error');
-    const fd  = new FormData(e.target);
-    btn.disabled = true; btn.textContent = 'Signing in…';
-    err.classList.add('hidden');
-    try {
-      const data = await api('POST', 'auth/login', { email: fd.get('email'), password: fd.get('password') });
-      if (data.success) {
-        state.user = data.user;
-        state.isDemoMode = false;
-        state.roster = null;
-        state.activity = null;
-        state.notifications = null;
-        state.settings = null;
-        applyTheme(data.user?.preferences);
-        if (data.requireOrgPicker) navigate('/select-org', true);
-        else navigate('/students', true);
-      } else {
-        err.textContent = data.error || 'Login failed';
-        err.classList.remove('hidden');
-      }
-    } catch (_) {
-      err.textContent = 'Network error. Please try again.';
-      err.classList.remove('hidden');
-    }
-    btn.disabled = false; btn.textContent = 'Sign in';
-  });
-}
-
-function renderSignup() {
-  mount(`
-    <div class="auth-page">
-      <div class="auth-card card card-body">
-        <div class="auth-logo">StoryTrackr</div>
-        <h1 class="auth-title">Create your account</h1>
-        <p class="auth-sub">Start tracking your students today</p>
-        <form class="form-stack" id="signup-form">
-          <div class="form-group">
-            <label class="form-label">Your name</label>
-            <input class="form-input" type="text" name="name" placeholder="Alex Johnson" required>
-          </div>
-          <div class="form-group">
-            <label class="form-label">Email</label>
-            <input class="form-input" type="email" name="email" placeholder="you@example.com" required autocomplete="email">
-          </div>
-          <div class="form-group">
-            <label class="form-label">Password</label>
-            <input class="form-input" type="password" name="password" placeholder="10+ chars, upper/lower/number" required>
-          </div>
-          <div id="signup-error" class="form-error hidden"></div>
-          <button class="btn btn-primary btn-full" type="submit" id="signup-btn">Create account</button>
-        </form>
-        <div class="auth-footer">
-          Already have an account? <a href="/login" onclick="navigate('/login');return false;">Sign in</a>
-        </div>
-        <p style="font-size:.75rem;color:var(--muted);text-align:center;margin-top:.75rem">
-          By signing up you agree to our <a href="https://storytrackr.app/terms.html" target="_blank">Terms</a> and <a href="https://storytrackr.app/privacy.html" target="_blank">Privacy Policy</a>.
-        </p>
-      </div>
-    </div>
-  `);
-
-  document.getElementById('signup-form').addEventListener('submit', async e => {
-    e.preventDefault();
-    const btn = document.getElementById('signup-btn');
-    const err = document.getElementById('signup-error');
-    const fd  = new FormData(e.target);
-    btn.disabled = true; btn.textContent = 'Creating…';
-    err.classList.add('hidden');
-    try {
-      const data = await api('POST', 'auth/signup', {
-        name: fd.get('name'), email: fd.get('email'),
-        password: fd.get('password'),
-      });
-      if (data.success) {
-        if (data.onboarding) {
-          state.user = data.user;
-          state.roster = null;
-          state.activity = null;
-          state.notifications = null;
-          state.settings = null;
-          applyTheme(data.user?.preferences);
-          navigate('/onboarding', true);
-        } else {
-          navigate('/login?notice=pending');
-          toast('Account submitted for approval. An admin will review shortly.', 'info', 5000);
-        }
-      } else {
-        err.textContent = data.error || 'Signup failed';
-        err.classList.remove('hidden');
-      }
-    } catch (_) { err.textContent = 'Network error.'; err.classList.remove('hidden'); }
-    btn.disabled = false; btn.textContent = 'Create account';
-  });
-}
-
-function renderForgotPassword() {
-  mount(`
-    <div class="auth-page">
-      <div class="auth-card card card-body">
-        <div class="auth-logo">StoryTrackr</div>
-        <h1 class="auth-title">Reset password</h1>
-        <p class="auth-sub">Enter your email and we'll send a reset link.</p>
-        <form class="form-stack" id="fp-form">
-          <div class="form-group">
-            <label class="form-label">Email</label>
-            <input class="form-input" type="email" name="email" placeholder="you@example.com" required>
-          </div>
-          <div id="fp-msg" class="hidden" style="font-size:.875rem;padding:.75rem;border-radius:var(--radius-sm)"></div>
-          <button class="btn btn-primary btn-full" type="submit" id="fp-btn">Send reset link</button>
-        </form>
-        <div class="auth-footer"><a href="/login" onclick="navigate('/login');return false;">← Back to login</a></div>
-      </div>
-    </div>
-  `);
-  document.getElementById('fp-form').addEventListener('submit', async e => {
-    e.preventDefault();
-    const btn = document.getElementById('fp-btn');
-    const msg = document.getElementById('fp-msg');
-    btn.disabled = true; btn.textContent = 'Sending…';
-    const data = await api('POST', 'auth/forgot-password', { email: new FormData(e.target).get('email') });
-    msg.textContent = data.message || 'If that account exists, a reset link has been sent.';
-    msg.style.background = 'var(--surface-2)'; msg.style.color = 'var(--text-2)';
-    msg.classList.remove('hidden');
-    btn.disabled = false; btn.textContent = 'Send reset link';
-  });
-}
-
-function renderResetPassword() {
-  const token = new URLSearchParams(window.location.search).get('token') || '';
-  mount(`
-    <div class="auth-page">
-      <div class="auth-card card card-body">
-        <div class="auth-logo">StoryTrackr</div>
-        <h1 class="auth-title">Set new password</h1>
-        <form class="form-stack" id="rp-form">
-          <div class="form-group">
-            <label class="form-label">New password</label>
-            <input class="form-input" type="password" name="newPassword" placeholder="10+ chars, upper/lower/number" required>
-          </div>
-          <div class="form-group">
-            <label class="form-label">Confirm password</label>
-            <input class="form-input" type="password" name="confirmPassword" placeholder="Same as above" required>
-          </div>
-          <div id="rp-error" class="form-error hidden"></div>
-          <button class="btn btn-primary btn-full" type="submit" id="rp-btn">Set password</button>
-        </form>
-      </div>
-    </div>
-  `);
-  document.getElementById('rp-form').addEventListener('submit', async e => {
-    e.preventDefault();
-    const btn = document.getElementById('rp-btn');
-    const err = document.getElementById('rp-error');
-    const fd  = new FormData(e.target);
-    btn.disabled = true; btn.textContent = 'Saving…';
-    const data = await api('POST', 'auth/reset-password', { token, newPassword: fd.get('newPassword'), confirmPassword: fd.get('confirmPassword') });
-    if (data.success) { navigate('/login?notice=reset-ok', true); }
-    else { err.textContent = data.error || 'Reset failed'; err.classList.remove('hidden'); btn.disabled = false; btn.textContent = 'Set password'; }
-  });
-}
-
-// ═══════════════════════════════════════════════════════════════
-// DEMO INIT
-// ═══════════════════════════════════════════════════════════════
-
-async function renderDemoInit() {
-  const token = new URLSearchParams(window.location.search).get('token');
-  if (!token) {
-    // No token — try to load existing demo session
-    await loadUser();
-    if (state.user?.role === 'demo' || state.isDemoMode) {
-      navigate('/dashboard', true);
-      return;
-    }
-    navigate('/login', true);
+  // P2 fix: empty state instead of blank grid
+  if (total === 0) {
+    renderEmptyState(
+      STATE.canEdit
+        ? 'No students yet. Click "+ Add Student" to add your first.'
+        : 'No students in this roster.'
+    );
     return;
   }
-  mount(`<div class="auth-page"><div class="card card-body text-center"><div class="auth-logo">StoryTrackr</div><p class="text-muted">Loading demo…</p><div class="spinner" style="margin:.5rem auto"></div></div></div>`);
-  try {
-    // Exchange token for session cookie
-    const data = await api('POST', 'demo-session/redeem', { token });
-    if (data.ok) {
-      // Remove token from URL
-      history.replaceState({}, '', '/demo');
-      await loadUser();
-      navigate('/dashboard', true);
-    } else {
-      mount(`<div class="auth-page"><div class="card card-body text-center"><h2>Demo session expired</h2><p class="text-muted mt-2">Please start a new demo from the marketing site.</p><a href="https://storytrackr.app" class="btn btn-primary mt-3">Back to StoryTrackr</a></div></div>`);
-    }
-  } catch (_) {
-    mount(`<div class="auth-page"><div class="card card-body text-center"><h2>Something went wrong</h2><a href="https://storytrackr.app" class="btn btn-primary mt-3">Back to StoryTrackr</a></div></div>`);
-  }
-}
 
-window.startDemo = async function() {
-  try {
-    const res  = await fetch('/api/demo-session', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
-    const data = await res.json();
-    if (data.redirect) window.location.href = data.redirect;
-  } catch (_) { toast('Could not start demo', 'error'); }
-};
+  const sections = [
+    { key: 'core',   label: 'Core' },
+    { key: 'loose',  label: 'Loose' },
+    { key: 'fringe', label: 'Fringe' },
+  ];
 
-// ═══════════════════════════════════════════════════════════════
-// SELECT ORG
-// ═══════════════════════════════════════════════════════════════
-
-function renderSelectOrg() {
-  const orgs = state.user?.orgIds || [];
-  mount(appShell(`
-    <div class="page-sm" style="padding-top:3rem">
-      <h1>Choose your organization</h1>
-      <p class="text-muted mt-2 mb-3">You belong to multiple organizations. Pick one to continue.</p>
-      <div class="org-picker">
-        ${orgs.map(id => `
-          <div class="org-option" onclick="selectOrg('${esc(id)}')">
-            <div class="org-icon">🏛️</div>
-            <div><div class="font-bold">${esc(id)}</div><div class="text-sm text-muted">Organization</div></div>
-          </div>
-        `).join('')}
-      </div>
-    </div>
-  `, 'dashboard'));
-}
-
-window.selectOrg = async function(orgId) {
-  // For now, just navigate — in full impl would call API to set session orgId
-  navigate('/dashboard', true);
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ONBOARDING WIZARD
-// ═══════════════════════════════════════════════════════════════
-
-let onboardStep = 1;
-const onboardData = {};
-
-function renderOnboarding() {
-  const steps = ['Create org', 'Invite leaders', 'Import roster', 'Done'];
-  const dots  = steps.map((s, i) => `<div class="step-dot ${i < onboardStep-1 ? 'done' : i === onboardStep-1 ? 'active' : ''}" title="${s}"></div>`).join('');
-
-  let content = '';
-  if (onboardStep === 1) content = onboardStep1();
-  if (onboardStep === 2) content = onboardStep2();
-  if (onboardStep === 3) content = onboardStep3();
-  if (onboardStep === 4) content = onboardStep4();
-
-  mount(`
-    <div class="onboarding-page">
-      <div class="onboarding-header">
-        <div class="auth-logo" style="text-align:left;margin-bottom:1rem">StoryTrackr</div>
-        <div class="flex items-center justify-between mb-2">
-          <span class="text-sm text-muted">Step ${onboardStep} of 4: ${steps[onboardStep-1]}</span>
-          <div class="steps-indicator">${dots}</div>
+  const html = sections.map(({ key, label }) => {
+    const students = data[key] ?? [];
+    const cards = students.map(renderStudentCard).join('');
+    return `
+      <div class="roster-section">
+        <div class="section-header ${key}">${label} — ${students.length}</div>
+        <div class="student-grid" data-section="${key}" data-sk="${sk}">
+          ${cards || '<div class="text-muted text-sm" style="padding:.5rem">None</div>'}
         </div>
       </div>
-      <div class="onboarding-card card card-body">${content}</div>
-    </div>
-  `);
-}
+    `;
+  }).join('');
 
-function onboardStep1() {
-  return `
-    <h2>Set up your ministry</h2>
-    <p class="text-muted mt-1 mb-3">Tell us about your organization so we can customize StoryTrackr for you.</p>
-    <form class="form-stack" onsubmit="onboard1Submit(event)">
-      <div class="form-group">
-        <label class="form-label">Ministry name *</label>
-        <input class="form-input" name="ministryName" value="${esc(onboardData.ministryName||state.user?.orgName||'')}" placeholder="Westside Students" required>
-      </div>
-      <div class="form-group">
-        <label class="form-label">Campus / Location</label>
-        <input class="form-input" name="campus" value="${esc(onboardData.campus||'')}" placeholder="Main Campus">
-      </div>
-      <div class="form-group">
-        <label class="form-label">Timezone</label>
-        <select class="form-input form-select" name="timezone">
-          <option value="America/New_York">Eastern (ET)</option>
-          <option value="America/Chicago">Central (CT)</option>
-          <option value="America/Denver">Mountain (MT)</option>
-          <option value="America/Los_Angeles">Pacific (PT)</option>
-          <option value="America/Anchorage">Alaska</option>
-          <option value="Pacific/Honolulu">Hawaii</option>
-        </select>
-      </div>
-      <div class="flex gap-2" style="justify-content:flex-end;margin-top:.5rem">
-        <button class="btn btn-primary" type="submit">Next →</button>
-      </div>
-    </form>
-  `;
-}
+  els.rosterGrid.innerHTML = html;
 
-window.onboard1Submit = async function(e) {
-  e.preventDefault();
-  const fd = new FormData(e.target);
-  onboardData.ministryName = fd.get('ministryName');
-  onboardData.campus       = fd.get('campus');
-  onboardData.timezone     = fd.get('timezone');
-  // Save to settings
-  await api('POST', 'settings', { ministryName: onboardData.ministryName, campus: onboardData.campus });
-  onboardStep = 2; renderOnboarding();
-};
-
-function onboardStep2() {
-  return `
-    <h2>Invite your leaders</h2>
-    <p class="text-muted mt-1 mb-3">Add leaders to your team. You can always invite more later from Settings.</p>
-    <div id="invite-list" style="display:flex;flex-direction:column;gap:.5rem;margin-bottom:1rem"></div>
-    <form class="flex gap-2" id="invite-add-form" onsubmit="addInvite(event)">
-      <input class="form-input" name="email" type="email" placeholder="leader@example.com" style="flex:1">
-      <button class="btn btn-secondary" type="submit">Add</button>
-    </form>
-    <p class="form-hint mt-2">They'll receive an email to set up their account.</p>
-    <div class="flex gap-2" style="justify-content:space-between;margin-top:1.5rem">
-      <button class="btn btn-ghost" onclick="onboardStep=1;renderOnboarding()">← Back</button>
-      <button class="btn btn-primary" onclick="onboard2Next()">Next →</button>
-    </div>
-  `;
-}
-
-const inviteList = [];
-window.addInvite = async function(e) {
-  e.preventDefault();
-  const email = new FormData(e.target).get('email');
-  if (!email || inviteList.includes(email)) return;
-  inviteList.push(email);
-  e.target.reset();
-  const list = document.getElementById('invite-list');
-  const item = document.createElement('div');
-  item.style.cssText = 'display:flex;align-items:center;justify-content:space-between;background:var(--surface-2);padding:.6rem .875rem;border-radius:var(--radius-xs);font-size:.875rem';
-  item.innerHTML = `<span>${esc(email)}</span><button style="background:none;border:none;cursor:pointer;color:var(--muted)" onclick="this.parentElement.remove()">✕</button>`;
-  list.appendChild(item);
-};
-
-window.onboard2Next = async function() {
-  // Fire-and-forget invites
-  inviteList.forEach(email => api('POST', 'admin/invite/manual', { email, name: email.split('@')[0], role: 'leader' }).catch(() => {}));
-  onboardStep = 3; renderOnboarding();
-};
-
-function onboardStep3() {
-  return `
-    <h2>Import your roster</h2>
-    <p class="text-muted mt-1 mb-3">Upload a CSV file with your student roster, or start fresh and add students manually.</p>
-    <div class="dropzone" id="csv-drop" onclick="document.getElementById('csv-file').click()">
-      <div style="font-size:2rem;margin-bottom:.5rem">📂</div>
-      <p style="font-weight:600;color:var(--text)">Click to upload CSV</p>
-      <p class="text-sm text-muted">Expected columns: Name, Grade, School, Birthday, Section (core/loose/fringe), Group</p>
-    </div>
-    <input type="file" id="csv-file" accept=".csv" class="hidden" onchange="handleCSV(event)">
-    <div id="csv-preview" class="mt-3"></div>
-    <div class="flex gap-2" style="justify-content:space-between;margin-top:1.5rem">
-      <button class="btn btn-ghost" onclick="onboardStep=2;renderOnboarding()">← Back</button>
-      <div class="flex gap-2">
-        <button class="btn btn-secondary" onclick="onboard3Skip()">Skip for now</button>
-        <button class="btn btn-primary" id="import-btn" onclick="onboard3Import()" disabled>Import →</button>
-      </div>
-    </div>
-  `;
-}
-
-let csvStudents = [];
-window.handleCSV = function(e) {
-  const file = e.target.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = ev => {
-    const rows = ev.target.result.trim().split('\n');
-    const headers = rows[0].toLowerCase().split(',').map(h => h.trim());
-    csvStudents = rows.slice(1).filter(r => r.trim()).map(row => {
-      const cols = row.split(',').map(c => c.trim().replace(/^"|"$/g, ''));
-      const get  = (...keys) => { for (const k of keys) { const i = headers.findIndex(h => h.includes(k)); if (i !== -1 && cols[i]) return cols[i]; } return ''; };
-      return { name: get('name'), grade: get('grade'), school: get('school'), birthday: get('birthday','birth'), section: get('section','group type') || 'core', group: get('group','sport','activity'), sk: 'hs' };
-    }).filter(s => s.name);
-    const preview = document.getElementById('csv-preview');
-    preview.innerHTML = `<p class="text-sm text-muted mb-2">${csvStudents.length} students found</p><div class="table-wrap"><table><thead><tr><th>Name</th><th>Grade</th><th>Section</th></tr></thead><tbody>${csvStudents.slice(0,5).map(s => `<tr><td>${esc(s.name)}</td><td>${esc(s.grade)}</td><td>${esc(s.section)}</td></tr>`).join('')}${csvStudents.length > 5 ? `<tr><td colspan="3" style="color:var(--muted);text-align:center">…and ${csvStudents.length - 5} more</td></tr>` : ''}</tbody></table></div>`;
-    document.getElementById('import-btn').disabled = false;
-  };
-  reader.readAsText(file);
-};
-
-window.onboard3Import = async function() {
-  const btn = document.getElementById('import-btn');
-  btn.disabled = true; btn.textContent = 'Importing…';
-  await Promise.allSettled(csvStudents.map(s => api('POST', 'students', s)));
-  onboardStep = 4; renderOnboarding();
-};
-window.onboard3Skip = function() { onboardStep = 4; renderOnboarding(); };
-
-function onboardStep4() {
-  return `
-    <div class="text-center" style="padding:1rem 0">
-      <div style="font-size:3.5rem;margin-bottom:1rem">🎉</div>
-      <h2>You're all set!</h2>
-      <p class="text-muted mt-2 mb-4">Your StoryTrackr is ready. Start by adding your first student or exploring the dashboard.</p>
-      <div class="flex gap-2" style="justify-content:center;flex-wrap:wrap">
-        <button class="btn btn-primary btn-lg" onclick="navigate('/dashboard',true)">Go to Dashboard</button>
-        <button class="btn btn-secondary btn-lg" onclick="navigate('/students',true)">View Roster</button>
-      </div>
-    </div>
-  `;
-}
-
-// ═══════════════════════════════════════════════════════════════
-// DASHBOARD
-// ═══════════════════════════════════════════════════════════════
-
-async function renderDashboard() {
-  mount(appShell(`<div class="loading-state"><div class="spinner"></div></div>`, 'dashboard'));
-  const [statsData, activityData] = await Promise.allSettled([
-    api('GET', 'activity/stats'),
-    api('GET', 'activity/recent'),
-  ]);
-  const stats    = statsData.status === 'fulfilled' ? statsData.value : {};
-  const activity = activityData.status === 'fulfilled' ? activityData.value?.items || [] : [];
-
-  document.getElementById('main-content').innerHTML = `
-    <div class="page">
-      <div class="flex items-center justify-between mb-3">
-        <h1>Dashboard</h1>
-        <button class="btn btn-primary btn-sm" onclick="${state.isDemoMode ? 'demoBlock()' : 'openLogModal()'}">+ Add Note</button>
-      </div>
-
-      <div class="stats-grid mb-3">
-        <div class="stat-card"><div class="stat-value">${stats.totalInteractions ?? '—'}</div><div class="stat-label">Total interactions</div></div>
-        <div class="stat-card"><div class="stat-value">${stats.thisMonth ?? '—'}</div><div class="stat-label">This month</div></div>
-        <div class="stat-card"><div class="stat-value">${stats.uniqueStudents ?? '—'}</div><div class="stat-label">Students reached</div></div>
-        <div class="stat-card"><div class="stat-value">${stats.uniqueLeaders ?? '—'}</div><div class="stat-label">Active leaders</div></div>
-      </div>
-
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
-        <div class="card">
-          <div class="card-header"><h3>Top Leaders</h3></div>
-          <div class="card-body">
-            ${(stats.topLeaders||[]).length ? stats.topLeaders.map(l => `<div class="flex items-center justify-between" style="padding:.4rem 0;border-bottom:1px solid var(--border)"><span class="text-sm">${esc(l.name)}</span><span class="badge badge-blue">${l.count}</span></div>`).join('') : '<p class="text-sm text-muted">No data yet</p>'}
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-header"><h3>Most Connected</h3></div>
-          <div class="card-body">
-            ${(stats.topStudents||[]).length ? stats.topStudents.map(s => `<div class="flex items-center justify-between" style="padding:.4rem 0;border-bottom:1px solid var(--border)"><span class="text-sm">${esc(s.name)}</span><span class="badge badge-green">${s.count}</span></div>`).join('') : '<p class="text-sm text-muted">No data yet</p>'}
-          </div>
-        </div>
-      </div>
-
-      <div class="card mt-3">
-        <div class="card-header"><h3>Recent Activity</h3><a href="/notes" onclick="navigate('/notes');return false;" class="text-sm" style="color:var(--primary)">View all</a></div>
-        <div class="card-body">
-          ${activity.length ? activity.slice(0,10).map(a => `
-            <div class="interaction-item">
-              <div class="interaction-dot"></div>
-              <div class="interaction-body">
-                <div class="interaction-meta">${esc(a.leader||'Leader')} · ${esc(a.studentName||'Student')} · ${formatDate(a.date||a.createdAt)}</div>
-                <div class="interaction-summary">${esc(a.summary||'').slice(0,200)}</div>
-              </div>
-            </div>
-          `).join('') : '<p class="text-sm text-muted">No activity yet. Add a note to get started!</p>'}
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-// ═══════════════════════════════════════════════════════════════
-// STUDENTS
-// ═══════════════════════════════════════════════════════════════
-
-function isInactive(student, days) {
-  if (!student.lastInteractionDate) return true;
-  const diff = (Date.now() - new Date(student.lastInteractionDate).getTime()) / 86400000;
-  return diff > days;
-}
-
-function applyFilters(students, filters, inactivityDays) {
-  return students.filter(s => {
-    if (filters.archived !== undefined) {
-      if (filters.archived && !s.archivedAt) return false;
-      if (!filters.archived && s.archivedAt) return false;
-    } else {
-      // By default hide archived
-      if (s.archivedAt) return false;
-    }
-    if (filters.grade && String(s.grade) !== String(filters.grade)) return false;
-    if (filters.school && s.school !== filters.school) return false;
-    if (filters.familyContacted !== undefined && !!s.familyContacted !== filters.familyContacted) return false;
-    if (filters.inactive && !isInactive(s, inactivityDays)) return false;
-    if (filters.birthdayMonth) {
-      const bday = s.birthday ? new Date(s.birthday).getMonth() + 1 : null;
-      if (!bday || String(bday) !== String(filters.birthdayMonth)) return false;
-    }
-    if (filters.search) {
-      const q = filters.search.toLowerCase();
-      if (!s.name.toLowerCase().includes(q) &&
-          !(s.school || '').toLowerCase().includes(q)) return false;
-    }
-    return true;
+  // Attach click listeners to cards
+  els.rosterGrid.querySelectorAll('.student-card').forEach(card => {
+    card.addEventListener('click', () => openDetailModal(card.dataset.id));
   });
 }
 
-async function renderStudentsView() {
-  const path = getRoute();
-  // Student detail: /students/SOME_ID
-  const idMatch = path.match(/^\/students\/(.+)$/);
-  if (idMatch) return renderStudentDetail(idMatch[1]);
+function renderEmptyState(message) {
+  els.rosterGrid.innerHTML = `
+    <div class="empty-state">
+      <svg width="48" height="48" fill="none" viewBox="0 0 24 24" stroke="currentColor" style="opacity:.35;margin:0 auto">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+          d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/>
+      </svg>
+      <p>${message}</p>
+    </div>
+  `;
+}
 
-  mount(appShell(`<div class="loading-state"><div class="spinner"></div></div>`, 'students'));
+function renderStudentCard(student) {
+  const meta = [student.grade ? `Grade ${student.grade}` : '', student.school].filter(Boolean).join(' · ');
+  const lastContact = student.lastInteractionDate
+    ? `Last contact: ${student.lastInteractionDate}`
+    : 'No recorded contact';
 
-  // Load settings and roster in parallel
-  const [rosterData, settingsData, statsData, notificationsData] = await Promise.allSettled([
-    state.roster ? Promise.resolve({ roster: state.roster }) : api('GET', 'students'),
-    state.settings ? Promise.resolve(state.settings) : api('GET', `settings/public?orgId=${encodeURIComponent(state.user?.orgId || 'default')}`),
-    api('GET', 'activity/stats'),
-    loadNotifications(),
-  ]);
+  return `
+    <div class="student-card" data-id="${student.id}" role="button" tabindex="0"
+         aria-label="View ${escHtml(student.name)}">
+      <div class="s-name">${escHtml(student.name)}</div>
+      ${meta ? `<div class="s-meta">${escHtml(meta)}</div>` : ''}
+      <div class="s-last">${escHtml(lastContact)}</div>
+    </div>
+  `;
+}
 
-  if (rosterData.status === 'fulfilled') {
-    state.roster = rosterData.value.roster || rosterData.value || { hs: { core:[], loose:[], fringe:[] }, ms: { core:[], loose:[], fringe:[] } };
-  }
-  if (settingsData.status === 'fulfilled') {
-    state.settings = settingsData.value;
-  }
-  if (notificationsData.status === 'fulfilled') {
-    state.notifications = notificationsData.value || [];
-  }
-  const stats = statsData.status === 'fulfilled' ? statsData.value : {};
-  const unreadCount = unreadNotificationsCount();
-  const unreadAttendance = (state.notifications || []).find(n => !n.read_at && n.type === 'attendance_open');
-  const settings = state.settings || {};
-  const inactivityDays = settings.inactivityDays ?? 90;
-  const statCards = settings.statCards || { totalStudents:true, totalInteractions:true, interactionsThisMonth:true, activeLeaders:true };
+// ── Student form modal ─────────────────────────────────────────────────────────
 
-  // Collect all unique schools/grades for filter options
-  let allStudentsFlat = [];
-  for (const sk of ['hs','ms']) for (const sec of ['core','loose','fringe']) {
-    (state.roster[sk]?.[sec]||[]).forEach(s => allStudentsFlat.push({ ...s, _sk: sk }));
-  }
-  const uniqueGrades  = [...new Set(allStudentsFlat.map(s => s.grade).filter(Boolean))].sort((a,b) => a-b);
-  const uniqueSchools = [...new Set(allStudentsFlat.map(s => s.school).filter(Boolean))].sort();
+function openStudentModal(student = null) {
+  STATE.editingId = student?.id ?? null;
+  els.studentModalTitle.textContent = student ? 'Edit Student' : 'Add Student';
+  els.studentFormSubmit.textContent = student ? 'Save Changes' : 'Add Student';
 
-  let currentSk    = 'hs';
-  let searchQuery  = '';
-  let showFilters  = false;
-  let activeFilters = {};
+  // Reset + populate form
+  els.studentForm.reset();
+  clearFieldErrors();
 
-  // Stat cards HTML
-  function renderStatCards() {
-    const totalStudents = allStudentsFlat.filter(s => !s.archivedAt).length;
-    const cards = [];
-    if (statCards.totalStudents)        cards.push({ label: 'Total Students',           value: totalStudents });
-    if (statCards.totalInteractions)    cards.push({ label: 'Total Interactions',        value: stats.totalInteractions ?? '—' });
-    if (statCards.interactionsThisMonth)cards.push({ label: 'This Month',                value: stats.thisMonth ?? '—' });
-    if (statCards.activeLeaders)        cards.push({ label: 'Active Leaders',            value: stats.uniqueLeaders ?? '—' });
-    if (!cards.length) return '';
-    return `<div class="stats-grid mb-3">${cards.map(c => `<div class="stat-card"><div class="stat-value">${c.value}</div><div class="stat-label">${c.label}</div></div>`).join('')}</div>`;
+  if (student) {
+    els.sfName.value    = student.name    ?? '';
+    els.sfGrade.value   = student.grade   ?? '';
+    els.sfSchool.value  = student.school  ?? '';
+    els.sfSk.value      = student.sk      ?? 'hs';
+    els.sfSection.value = student.section ?? 'core';
+    els.sfBirthday.value = student.birthday ?? '';
+    els.sfGoal.value    = student.primaryGoal ?? '';
   }
 
-  function renderRoster() {
-    const skStudents = [];
-    for (const sec of ['core','loose','fringe']) {
-      (state.roster[currentSk]?.[sec]||[]).forEach(s => skStudents.push(s));
+  els.studentModal.classList.remove('hidden');
+  els.sfName.focus();
+}
+
+function closeStudentModal() {
+  els.studentModal.classList.add('hidden');
+  STATE.editingId = null;
+}
+
+function clearFieldErrors() {
+  document.querySelectorAll('.field-error').forEach(el => el.classList.remove('visible'));
+  document.querySelectorAll('.form-control').forEach(el => el.classList.remove('error'));
+}
+
+function showFieldError(errEl, inputEl) {
+  errEl.classList.add('visible');
+  inputEl.classList.add('error');    // P2 fix: highlight the field too
+  inputEl.focus();
+}
+
+async function handleStudentFormSubmit(e) {
+  e.preventDefault();
+  clearFieldErrors();
+
+  const name = els.sfName.value.trim();
+  if (!name) {
+    showFieldError(els.errSfName, els.sfName);
+    return;
+  }
+
+  const payload = {
+    name,
+    grade:       els.sfGrade.value.trim()   || null,
+    school:      els.sfSchool.value.trim()  || null,
+    sk:          els.sfSk.value,
+    section:     els.sfSection.value,
+    birthday:    els.sfBirthday.value       || null,
+    primaryGoal: els.sfGoal.value.trim()    || null,
+  };
+
+  els.studentFormSubmit.disabled = true;
+  els.studentFormSubmit.textContent = 'Saving…';
+
+  try {
+    let url = '/api/sheet/write';
+    if (STATE.editingId) {
+      url += '?action=update';
+      payload.id = STATE.editingId;
+    } else {
+      url += '?action=add';
     }
-    const filtered = applyFilters(skStudents, { ...activeFilters, search: searchQuery || activeFilters.search }, inactivityDays);
 
-    const filterActive = Object.keys(activeFilters).length > 0;
+    const res = await apiFetch(url, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
 
-    document.getElementById('main-content').innerHTML = `
-      <div class="page">
-        <div class="flex items-center justify-between mb-3">
-          <h1>Students</h1>
-          <div class="flex gap-2">
-            <div style="position:relative">
-              <input class="form-input" style="max-width:200px;padding:.4rem .75rem;font-size:.875rem;padding-right:2rem" placeholder="Search…" value="${esc(searchQuery)}" id="student-search"
-                oninput="searchStudents(this.value)"
-                onfocus="if(!showFiltersOpen){showStudentFilters()}"
-              >
-              ${filterActive ? `<span style="position:absolute;top:50%;right:.5rem;transform:translateY(-50%);width:8px;height:8px;background:var(--primary);border-radius:50%"></span>` : ''}
-            </div>
-            <button class="btn btn-secondary btn-sm" onclick="toggleStudentFilters()" title="Filters" style="${filterActive ? 'border-color:var(--primary);color:var(--primary)' : ''}">⚙ Filters</button>
-            ${!state.isDemoMode ? `<button class="btn btn-primary btn-sm" onclick="openAddStudentModal()">+ Add Student</button>` : ''}
-          </div>
-        </div>
+    if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
 
-        ${unreadCount ? `
-          <div class="card mb-3" style="border-color:var(--primary)">
-            <div class="card-body" style="display:flex;align-items:center;justify-content:space-between;gap:1rem">
-              <div>
-                <div class="font-bold">${unreadCount} notification${unreadCount === 1 ? '' : 's'} waiting</div>
-                <div class="text-sm text-muted">${esc(unreadAttendance?.body || 'Review your in-app alerts and take action.')}</div>
-              </div>
-              <div class="flex gap-2">
-                <button class="btn btn-secondary btn-sm" onclick="markAllNotificationsRead()">Mark read</button>
-                <button class="btn btn-primary btn-sm" onclick="navigate('/attendance')">Open Attendance</button>
-              </div>
-            </div>
-          </div>
-        ` : ''}
+    showToast(STATE.editingId ? 'Student updated.' : 'Student added.', 'success');
+    closeStudentModal();
+    await loadRoster();
+  } catch (err) {
+    // P2 fix: surface error
+    showToast(`Could not save: ${err.message}`, 'error');
+  } finally {
+    els.studentFormSubmit.disabled = false;
+    els.studentFormSubmit.textContent = STATE.editingId ? 'Save Changes' : 'Add Student';
+  }
+}
 
-        ${renderStatCards()}
+// ── Student detail modal ──────────────────────────────────────────────────────
 
-        <div id="student-filter-panel" class="${showFilters ? '' : 'hidden'}" style="background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius);padding:1rem;margin-bottom:1rem">
-          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:.75rem">
-            <div class="form-group" style="margin:0">
-              <label class="form-label" style="font-size:.75rem">Grade</label>
-              <select class="form-input form-select" style="font-size:.8rem;padding:.3rem .5rem" onchange="setFilter('grade',this.value||undefined)">
-                <option value="">Any grade</option>
-                ${uniqueGrades.map(g => `<option value="${g}" ${activeFilters.grade==g?'selected':''}>${g}</option>`).join('')}
-              </select>
-            </div>
-            <div class="form-group" style="margin:0">
-              <label class="form-label" style="font-size:.75rem">School</label>
-              <select class="form-input form-select" style="font-size:.8rem;padding:.3rem .5rem" onchange="setFilter('school',this.value||undefined)">
-                <option value="">Any school</option>
-                ${uniqueSchools.map(s => `<option value="${esc(s)}" ${activeFilters.school===s?'selected':''}>${esc(s)}</option>`).join('')}
-              </select>
-            </div>
-            <div class="form-group" style="margin:0">
-              <label class="form-label" style="font-size:.75rem">Birthday Month</label>
-              <select class="form-input form-select" style="font-size:.8rem;padding:.3rem .5rem" onchange="setFilter('birthdayMonth',this.value||undefined)">
-                <option value="">Any month</option>
-                ${['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'].map((m,i) => `<option value="${i+1}" ${activeFilters.birthdayMonth==i+1?'selected':''}>${m}</option>`).join('')}
-              </select>
-            </div>
-            <div class="form-group" style="margin:0;display:flex;flex-direction:column;justify-content:flex-end">
-              <label style="display:flex;align-items:center;gap:.4rem;font-size:.8rem;cursor:pointer">
-                <input type="checkbox" ${activeFilters.familyContacted?'checked':''} onchange="setFilter('familyContacted',this.checked?true:undefined)">
-                Family Contacted
-              </label>
-            </div>
-            <div class="form-group" style="margin:0;display:flex;flex-direction:column;justify-content:flex-end">
-              <label style="display:flex;align-items:center;gap:.4rem;font-size:.8rem;cursor:pointer">
-                <input type="checkbox" ${activeFilters.inactive?'checked':''} onchange="setFilter('inactive',this.checked?true:undefined)">
-                Inactive (${inactivityDays}d)
-              </label>
-            </div>
-            <div class="form-group" style="margin:0;display:flex;flex-direction:column;justify-content:flex-end">
-              <label style="display:flex;align-items:center;gap:.4rem;font-size:.8rem;cursor:pointer">
-                <input type="checkbox" ${activeFilters.archived?'checked':''} onchange="setFilter('archived',this.checked?true:undefined)">
-                Archived
-              </label>
-            </div>
-          </div>
-          ${filterActive ? `<button class="btn btn-ghost btn-sm mt-2" onclick="clearFilters()">Clear filters</button>` : ''}
-        </div>
+function findStudent(id) {
+  for (const sk of ['hs', 'ms']) {
+    for (const section of ['core', 'loose', 'fringe']) {
+      const found = (STATE.roster[sk]?.[section] ?? []).find(s => s.id === id);
+      if (found) return found;
+    }
+  }
+  return null;
+}
 
-        <div class="tabs mb-3">
-          <button class="tab-btn ${currentSk==='hs'?'active':''}" onclick="switchSk('hs')">High School</button>
-          <button class="tab-btn ${currentSk==='ms'?'active':''}" onclick="switchSk('ms')">Middle School</button>
-        </div>
+function openDetailModal(id) {
+  const student = findStudent(id);
+  if (!student) return;
 
-        ${filtered.length ? `
-          <div class="student-grid">
-            ${filtered.map(s => `
-              <div class="student-card" onclick="navigate('/students/${esc(s.id)}')">
-                <div class="student-avatar">
-                  ${s.photoUrl ? `<img src="${esc(s.photoUrl)}" alt="${esc(s.name)}">` : s.name.charAt(0).toUpperCase()}
-                </div>
-                <div class="student-info">
-                  <div class="student-name">${esc(s.name)}</div>
-                  <div class="student-meta">
-                    ${[s.grade ? `Gr. ${esc(String(s.grade))}` : '', esc(s.school||''), s.birthday ? formatBirthday(s.birthday) : ''].filter(Boolean).join(' · ')}
-                  </div>
-                  ${s.lastInteractionDate ? `<div class="student-meta" style="font-size:.75rem">Last: ${formatDate(s.lastInteractionDate)}</div>` : ''}
-                </div>
-                <div class="student-status" style="display:flex;flex-direction:column;align-items:flex-end;gap:.3rem">
-                  ${s.archivedAt ? `<span class="badge badge-gray">Archived</span>` : isInactive(s, inactivityDays) ? `<span class="badge badge-yellow" style="background:#fef9c3;color:#854d0e">Inactive</span>` : `<span class="badge badge-green">Active</span>`}
-                  <label onclick="event.stopPropagation()" style="display:flex;align-items:center;gap:.3rem;font-size:.75rem;cursor:pointer;color:var(--muted)">
-                    <input type="checkbox" ${s.familyContacted?'checked':''} onchange="toggleFamilyContacted('${esc(s.id)}',this.checked);event.stopPropagation()">
-                    Family
-                  </label>
-                </div>
-              </div>
-            `).join('')}
-          </div>
-        ` : `
-          <div class="empty-state">
-            <div class="empty-icon">👥</div>
-            <div class="empty-title">${filterActive || searchQuery ? 'No students match your filters' : "It's quiet here."}</div>
-            <p class="empty-desc">${filterActive || searchQuery ? 'Try adjusting your search or filters.' : state.isDemoMode ? 'Demo data will appear here.' : 'Add your first student to get started.'}</p>
-            ${!state.isDemoMode && !filterActive && !searchQuery ? `<button class="btn btn-primary mt-3" onclick="openAddStudentModal()">+ Add Student</button>` : ''}
-          </div>
-        `}
-      </div>
+  els.detailModalTitle.textContent = student.name;
+
+  const goals = (student.goals ?? []).map(g => `<li>${escHtml(g)}</li>`).join('');
+
+  els.detailContent.innerHTML = `
+    <div class="detail-section">
+      <h3>Info</h3>
+      <p class="text-sm">${[
+        student.grade  ? `Grade ${student.grade}` : '',
+        student.school ? student.school : '',
+        student.birthday ? `Birthday: ${student.birthday}` : '',
+      ].filter(Boolean).join(' · ') || 'No info'}</p>
+    </div>
+    ${student.primaryGoal ? `
+    <div class="detail-section">
+      <h3>Primary Goal</h3>
+      <p class="text-sm">${escHtml(student.primaryGoal)}</p>
+    </div>` : ''}
+    ${goals ? `
+    <div class="detail-section">
+      <h3>Goals</h3>
+      <ul class="text-sm" style="padding-left:1.2rem">${goals}</ul>
+    </div>` : ''}
+    <div class="detail-section">
+      <h3>Recent Interaction</h3>
+      <p class="text-sm">${student.lastInteractionDate
+        ? `${student.lastInteractionDate} — ${escHtml(student.lastInteractionSummary ?? '')} (${escHtml(student.lastLeader ?? '')})`
+        : 'No recorded interactions yet.'}</p>
+    </div>
+    <div class="detail-section">
+      <h3>Total Interactions</h3>
+      <p class="text-sm">${student.interactionCount ?? 0}</p>
+    </div>
+  `;
+
+  // Footer actions (only for editors)
+  els.detailFooter.innerHTML = '';
+  if (STATE.canEdit) {
+    els.detailFooter.innerHTML = `
+      <button class="btn btn-danger btn-sm" id="delete-student-btn">Delete</button>
+      <button class="btn btn-secondary btn-sm" id="edit-student-btn">Edit</button>
     `;
+    $('edit-student-btn').addEventListener('click', () => {
+      closeDetailModal();
+      openStudentModal(student);
+    });
+    $('delete-student-btn').addEventListener('click', () => handleDeleteStudent(student.id, student.name));
   }
 
-  let showFiltersOpen = false;
+  els.detailModal.classList.remove('hidden');
+}
 
-  window.switchSk = function(sk) { currentSk = sk; renderRoster(); };
-  window.searchStudents = function(q) { searchQuery = q; renderRoster(); };
-  window.showStudentFilters = function() { showFilters = true; showFiltersOpen = true; renderRoster(); };
-  window.toggleStudentFilters = function() { showFilters = !showFilters; showFiltersOpen = showFilters; renderRoster(); };
-  window.setFilter = function(key, val) {
-    if (val === undefined) delete activeFilters[key];
-    else activeFilters[key] = val;
-    renderRoster();
-  };
-  window.clearFilters = function() { activeFilters = {}; renderRoster(); };
-  window.toggleFamilyContacted = async function(id, val) {
-    const data = await api('PUT', `students/${id}`, { familyContacted: val });
-    if (data.success || data.student) {
-      // Update local roster cache
-      for (const sk of ['hs','ms']) for (const sec of ['core','loose','fringe']) {
-        const list = state.roster[sk]?.[sec] || [];
-        const idx = list.findIndex(s => s.id === id);
-        if (idx !== -1) { list[idx] = { ...list[idx], familyContacted: val }; }
-      }
-    }
-  };
+function closeDetailModal() {
+  els.detailModal.classList.add('hidden');
+}
 
-  window.markAllNotificationsRead = async function() {
-    await api('POST', 'notifications/read', {});
-    await loadNotifications(true);
-    renderRoster();
-  };
+async function handleDeleteStudent(id, name) {
+  if (!confirm(`Delete ${name}? This cannot be undone.`)) return;
 
+  try {
+    const res = await apiFetch('/api/sheet/write?action=delete', {
+      method: 'POST',
+      body: JSON.stringify({ id }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+
+    showToast('Student deleted.', 'success');
+    closeDetailModal();
+    await loadRoster();
+  } catch (err) {
+    showToast(`Delete failed: ${err.message}`, 'error');
+  }
+}
+
+// ── Forgot password ──────────────────────────────────────────────────────────
+
+async function handleForgotPassword() {
+  const email = els.loginEmail.value.trim();
+  if (!email) {
+    showFieldError(els.errEmail, els.loginEmail);
+    showToast('Enter your email first.', 'info');
+    return;
+  }
+
+  try {
+    await apiFetch('/api/auth/reset', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    });
+    // Show confirmation regardless of whether email exists (security best practice)
+    els.resetSent.classList.remove('hidden');
+    showToast('If that email exists, a reset link has been sent.', 'info');
+  } catch (err) {
+    showToast('Could not send reset email. Try again.', 'error');
+  }
+}
+
+// ── Login flow ───────────────────────────────────────────────────────────────
+
+async function handleLeaderLoginSubmit(e) {
+  e.preventDefault();
+  clearFieldErrors();
+
+  const email    = els.loginEmail.value.trim();
+  const password = els.loginPassword.value;
+
+  let valid = true;
+  if (!email || !email.includes('@')) { showFieldError(els.errEmail, els.loginEmail); valid = false; }
+  if (!password)                       { showFieldError(els.errPassword, els.loginPassword); valid = false; }
+  if (!valid) return;
+
+  els.loginBtn.disabled = true;
+  els.loginBtn.textContent = 'Signing in…';
+
+  try {
+    const data = await tryLeaderLogin(email, password);
+    STATE.session = { orgId: data.orgId, role: data.role, readonly: false };
+    STATE.canEdit = true;
+    enterApp({ email, readonly: false });
+  } catch (err) {
+    showToast(err.message, 'error');
+  } finally {
+    els.loginBtn.disabled = false;
+    els.loginBtn.textContent = 'Sign in';
+  }
+}
+
+async function handlePasscodeSubmit(e) {
+  e.preventDefault();
+  clearFieldErrors();
+
+  const passcode = els.passcodeInput.value.trim();
+  if (!passcode) { showFieldError(els.errPasscode, els.passcodeInput); return; }
+
+  els.passcodeBtn.disabled = true;
+  els.passcodeBtn.textContent = 'Checking…';
+
+  try {
+    const data = await tryPasscodeLogin(passcode);
+    STATE.session = { orgId: data.orgId, role: 'readonly', readonly: true };
+    STATE.canEdit = false;
+    enterApp({ email: '', readonly: true });
+  } catch (err) {
+    showToast(err.message, 'error');
+  } finally {
+    els.passcodeBtn.disabled = false;
+    els.passcodeBtn.textContent = 'Enter';
+  }
+}
+
+// ── App enter / leave ─────────────────────────────────────────────────────────
+
+function enterApp({ email = '', readonly = false } = {}) {
+  els.loginGate.classList.add('hidden');
+  els.app.classList.add('visible');
+
+  if (readonly) {
+    els.readonlyBadge.classList.remove('hidden');
+    els.addStudentBtn.classList.add('hidden');
+  } else {
+    els.readonlyBadge.classList.add('hidden');
+    els.addStudentBtn.classList.remove('hidden');
+  }
+
+  if (email) els.userEmail.textContent = email;
+
+  loadRoster();
+}
+
+async function handleLogout() {
+  els.logoutBtn.disabled = true;
+  try {
+    await doLogout();
+    STATE.session = null;
+    STATE.canEdit = false;
+    STATE.roster  = { hs: { core: [], loose: [], fringe: [] }, ms: { core: [], loose: [], fringe: [] } };
+
+    els.app.classList.remove('visible');
+    els.loginGate.classList.remove('hidden');
+    els.loginForm.reset();
+    els.passcodeForm.reset();
+    els.rosterGrid.innerHTML = '';
+    els.readonlyBadge.classList.add('hidden');
+    els.addStudentBtn.classList.remove('hidden');
+  } catch (_) {
+    // error already shown by doLogout
+  } finally {
+    els.logoutBtn.disabled = false;
+  }
+}
+
+// ── School tabs ──────────────────────────────────────────────────────────────
+
+function setSchoolTab(sk) {
+  STATE.currentSchool = sk;
+  document.querySelectorAll('.school-tab').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.school === sk);
+  });
   renderRoster();
 }
 
-async function renderStudentDetail(studentId) {
-  mount(appShell(`<div class="loading-state"><div class="spinner"></div></div>`, 'students'));
+// ── Tab (login form) switching ─────────────────────────────────────────────────
 
-  // Find student in roster (or fetch)
-  let student = null;
-  if (state.roster) {
-    for (const sk of ['hs','ms']) for (const sec of ['core','loose','fringe']) {
-      student = (state.roster[sk]?.[sec]||[]).find(s => s.id === studentId || String(s.index) === studentId);
-      if (student) break; if (student) break;
-    }
-  }
-  if (!student) {
-    try {
-      const data = await api('GET', `students/${studentId}`);
-      student = data.student;
-    } catch (_) {}
-  }
-  if (!student) {
-    document.getElementById('main-content').innerHTML = `<div class="empty-state"><div class="empty-title">Student not found</div><button class="btn btn-secondary mt-3" onclick="navigate('/students')">← Back</button></div>`;
-    return;
-  }
-
-  const [interactionRes, settingsRes] = await Promise.allSettled([
-    api('GET', `student/interactions?sk=${student.sk||'hs'}&section=${student.section||'core'}&index=${student.index||0}`),
-    state.settings ? Promise.resolve(state.settings) : api('GET', `settings/public?orgId=${encodeURIComponent(state.user?.orgId||'default')}`),
-  ]);
-  const interactions = interactionRes.status === 'fulfilled' ? (interactionRes.value.interactions || []) : [];
-  if (settingsRes.status === 'fulfilled') state.settings = settingsRes.value;
-  const features = state.settings?.features || { goals:true, notes:true, activity:true, familyContact:true };
-  const inactivityDays = state.settings?.inactivityDays ?? 90;
-
-  let editing = false;
-
-  function renderDetail() {
-    const age = calcAge(student.birthday);
-    document.getElementById('main-content').innerHTML = `
-      <div class="page" style="padding-top:0">
-        <div style="padding:1rem 0;display:flex;align-items:center;justify-content:space-between">
-          <button class="btn btn-ghost btn-sm" onclick="navigate('/students')">← Back to roster</button>
-          ${!state.isDemoMode ? `
-            <div class="flex gap-2">
-              ${editing
-                ? `<button class="btn btn-ghost btn-sm" onclick="cancelEditStudent()">Cancel</button>
-                   <button class="btn btn-primary btn-sm" onclick="saveStudentEdit('${esc(student.id)}')">Save</button>`
-                : `<button class="btn btn-secondary btn-sm" onclick="startEditStudent()">Edit</button>
-                   <button class="btn btn-primary btn-sm" onclick="openLogModal('${esc(student.id)}','${esc(student.name)}','${esc(student.sk||'hs')}','${esc(student.section||'core')}',${student.index||0})">+ Add Note</button>`}
-            </div>
-          ` : `<span class="badge badge-yellow">Demo</span>`}
-        </div>
-        <div class="card">
-          <div class="student-detail-header">
-            <div class="student-detail-avatar" id="student-photo-wrap" style="position:relative;cursor:${editing&&!state.isDemoMode?'pointer':'default'}" ${editing&&!state.isDemoMode?'onclick="triggerPhotoUpload()"':''}>
-              ${student.photoUrl ? `<img src="${esc(student.photoUrl)}" alt="" id="student-photo-img">` : `<span>${student.name.charAt(0).toUpperCase()}</span>`}
-              ${editing&&!state.isDemoMode ? `<div style="position:absolute;bottom:0;right:0;background:var(--primary);color:#fff;border-radius:50%;width:24px;height:24px;display:flex;align-items:center;justify-content:center;font-size:.7rem">📷</div>` : ''}
-            </div>
-            <input type="file" id="student-photo-file" accept="image/*" class="hidden" onchange="handleStudentPhotoUpload(event,'${esc(student.id)}')">
-            <div class="student-detail-info" style="flex:1">
-              ${editing
-                ? `<input class="form-input" id="edit-name" value="${esc(student.name)}" style="font-size:1.2rem;font-weight:700;margin-bottom:.5rem">`
-                : `<h1 style="font-size:1.4rem">${esc(student.name)}</h1>`}
-              <div style="font-size:.85rem;color:var(--muted);margin-top:.25rem">
-                ${editing ? `
-                  <div style="display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.5rem">
-                    <input class="form-input" id="edit-grade" value="${esc(String(student.grade||''))}" placeholder="Grade" style="width:80px;font-size:.85rem;padding:.3rem .5rem">
-                    <input class="form-input" id="edit-school" value="${esc(student.school||'')}" placeholder="School" style="flex:1;min-width:120px;font-size:.85rem;padding:.3rem .5rem">
-                    <input class="form-input" id="edit-birthday" type="date" value="${esc(student.birthday||'')}" style="font-size:.85rem;padding:.3rem .5rem">
-                    <input class="form-input" id="edit-group" value="${esc(student.group||'')}" placeholder="Group/Sport" style="flex:1;min-width:120px;font-size:.85rem;padding:.3rem .5rem">
-                  </div>
-                ` : `
-                  ${[student.grade ? `Grade ${student.grade}` : '', student.school, student.group].filter(Boolean).join(' · ')}
-                  ${student.birthday ? `<span style="margin-left:.5rem">🎂 ${formatBirthday(student.birthday)}${age !== null ? ` (age ${age})` : ''}</span>` : ''}
-                `}
-              </div>
-              ${features.familyContact ? `
-                <label style="display:inline-flex;align-items:center;gap:.4rem;margin-top:.5rem;font-size:.85rem;cursor:pointer">
-                  <input type="checkbox" id="detail-family" ${student.familyContacted?'checked':''} onchange="toggleFamilyContacted('${esc(student.id)}',this.checked)">
-                  Family Contacted
-                </label>
-              ` : ''}
-              <div class="flex gap-2 mt-2">
-                ${isInactive(student, inactivityDays) && !student.archivedAt ? `<span class="badge" style="background:#fef9c3;color:#854d0e">Inactive</span>` : ''}
-                ${student.archivedAt ? `<span class="badge badge-gray">Archived</span>` : ''}
-              </div>
-            </div>
-          </div>
-
-          ${features.goals && (student.goals||[]).length > 0 ? `
-            <div style="padding:1rem 1.5rem;border-top:1px solid var(--border)">
-              <h3 style="font-size:.9rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:.75rem">Goals</h3>
-              ${renderGoalsList(student)}
-            </div>
-          ` : ''}
-
-          ${features.activity || features.notes ? `
-            <div style="padding:1rem 1.5rem;border-top:1px solid var(--border)">
-              <h3 style="font-size:.9rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:.75rem">Activity (${interactions.length})</h3>
-              ${renderInteractionsList(interactions, student)}
-            </div>
-          ` : ''}
-        </div>
-      </div>
-    `;
-  }
-
-  window.startEditStudent  = function() { editing = true;  renderDetail(); };
-  window.cancelEditStudent = function() { editing = false; renderDetail(); };
-  window.saveStudentEdit   = async function(id) {
-    const updates = {
-      name:     document.getElementById('edit-name')?.value || student.name,
-      grade:    document.getElementById('edit-grade')?.value ? Number(document.getElementById('edit-grade').value) : null,
-      school:   document.getElementById('edit-school')?.value || '',
-      birthday: document.getElementById('edit-birthday')?.value || '',
-      group:    document.getElementById('edit-group')?.value || '',
-    };
-    const data = await api('PUT', `students/${id}`, updates);
-    if (data.success || data.student) {
-      student = { ...student, ...updates, ...(data.student || {}) };
-      if (state.roster) {
-        for (const sk of ['hs','ms']) for (const sec of ['core','loose','fringe']) {
-          const list = state.roster[sk]?.[sec] || [];
-          const idx = list.findIndex(s => s.id === id);
-          if (idx !== -1) list[idx] = { ...list[idx], ...updates };
-        }
-      }
-      editing = false; renderDetail(); toast('Saved', 'success');
-    } else { toast(data.error || 'Save failed', 'error'); }
-  };
-
-  window.triggerPhotoUpload = function() { document.getElementById('student-photo-file')?.click(); };
-
-  window.handleStudentPhotoUpload = async function(e, id) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    openCropModal(file, async blob => {
-      const form = new FormData();
-      form.append('file', blob, 'photo.jpg');
-      try {
-        const res = await fetch('/api/upload-photo?type=student', { method:'POST', credentials:'include', body:form });
-        const data = await res.json();
-        if (data.url) {
-          await api('PUT', `students/${id}`, { photoUrl: data.url });
-          student.photoUrl = data.url;
-          if (state.roster) {
-            for (const sk of ['hs','ms']) for (const sec of ['core','loose','fringe']) {
-              const list = state.roster[sk]?.[sec] || [];
-              const idx = list.findIndex(s => s.id === id);
-              if (idx !== -1) list[idx].photoUrl = data.url;
-            }
-          }
-          renderDetail();
-        }
-      } catch(_) { toast('Photo upload failed', 'error'); }
+function initLoginTabs() {
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const tab = btn.dataset.tab;
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+      btn.classList.add('active');
+      $(`tab-${tab}`).classList.add('active');
+      clearFieldErrors();
     });
-  };
-
-  renderDetail();
-}
-
-function renderInteractionsList(interactions, student) {
-  if (!interactions.length) return `<div class="card-body"><div class="empty-state"><div class="empty-icon">📝</div><div class="empty-title">No notes yet</div><p class="empty-desc">Add a note to start building this student's story.</p></div></div>`;
-  return `<div class="card-body"><div>${interactions.slice().reverse().map(n => `
-    <div class="interaction-item">
-      <div class="interaction-dot"></div>
-      <div class="interaction-body">
-        <div class="interaction-meta">${esc(n.leader||'')} · ${formatDate(n.date||n.createdAt)}</div>
-        <div class="interaction-summary">${esc(n.summary||'')}</div>
-        ${n.tags?.length ? `<div class="flex gap-2 mt-1">${n.tags.map(t => `<span class="tag">${esc(t)}</span>`).join('')}</div>` : ''}
-      </div>
-    </div>
-  `).join('')}</div></div>`;
-}
-
-function renderGoalsList(student) {
-  const goals = student.goals || [];
-  if (!goals.length) return `<div class="card-body"><p class="text-muted text-sm">No goals set yet.</p></div>`;
-  return `<div class="card-body"><div style="display:flex;flex-direction:column;gap:.5rem">${goals.map((g,i) => `
-    <div class="goal-item">
-      <button class="goal-check ${g.done ? 'done' : ''}" ${state.isDemoMode ? 'onclick="demoBlock()"' : `onclick="toggleGoal(${i})"`}>${g.done ? '✓' : ''}</button>
-      <span class="goal-text ${g.done ? 'done' : ''}">${esc(g.text||g)}</span>
-    </div>
-  `).join('')}</div></div>`;
-}
-
-function renderStudentInfo(student) {
-  const rows = [
-    ['Birthday', student.birthday],
-    ['School', student.school],
-    ['Grade', student.grade],
-    ['Group / Sport', student.group],
-    ['Primary Goal', student.primaryGoal],
-    ['Interaction Count', student.interactionCount],
-    ['Last Leader', student.lastLeader],
-  ].filter(r => r[1]);
-  return `<div class="card-body"><div style="display:grid;grid-template-columns:auto 1fr;gap:.75rem 1.5rem">${rows.map(([k,v]) => `<span class="text-sm text-muted">${esc(k)}</span><span class="text-sm">${esc(String(v))}</span>`).join('')}</div></div>`;
-}
-
-// ═══════════════════════════════════════════════════════════════
-// NOTES
-// ═══════════════════════════════════════════════════════════════
-
-async function renderNotes() {
-  mount(appShell(`<div class="loading-state"><div class="spinner"></div></div>`, 'notes'));
-  const data     = await api('GET', 'activity/recent');
-  const activity = data.items || [];
-
-  document.getElementById('main-content').innerHTML = `
-    <div class="page">
-      <div class="flex items-center justify-between mb-3">
-        <h1>Notes &amp; Activity</h1>
-        <button class="btn btn-primary btn-sm" onclick="${state.isDemoMode ? 'demoBlock()' : 'openLogModal()'}">+ Add Note</button>
-      </div>
-      <div class="card">
-        <div class="card-body">
-          ${activity.length ? activity.map(a => `
-            <div class="interaction-item">
-              <div class="interaction-dot"></div>
-              <div class="interaction-body">
-                <div class="interaction-meta">${esc(a.leader||'')} · ${esc(a.studentName||'')} · ${formatDate(a.date||a.createdAt)}</div>
-                <div class="interaction-summary">${esc(a.summary||'')}</div>
-                ${a.tags?.length ? `<div class="flex gap-2 mt-1">${a.tags.map(t => `<span class="tag">${esc(t)}</span>`).join('')}</div>` : ''}
-              </div>
-            </div>
-          `).join('') : `<div class="empty-state"><div class="empty-icon">📝</div><div class="empty-title">No notes yet</div><p class="empty-desc">Add notes and they'll appear here.</p></div>`}
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-// ═══════════════════════════════════════════════════════════════
-// BRAIN DUMP
-// ═══════════════════════════════════════════════════════════════
-
-async function renderBrainDump() {
-  mount(appShell(`
-    <div class="page">
-      <h1>Brain Dump</h1>
-      <p class="text-muted mt-1 mb-3">Write freely about your week. StoryTrackr will find the students you mentioned and create draft notes.</p>
-      <div class="card card-body">
-        <div class="form-group">
-          <label class="form-label">What happened this week?</label>
-          <textarea class="form-input form-textarea" id="bd-text" style="min-height:180px" placeholder="I caught up with Tyler after church — he's been going through a tough time at home. Also ran into Maya at coffee shop and we talked about her upcoming baptism…" ${state.isDemoMode ? 'readonly' : ''}></textarea>
-        </div>
-        ${!state.isDemoMode ? `
-          <button class="btn btn-primary mt-2" onclick="runBrainDump()">Find Students →</button>
-        ` : `<button class="btn btn-secondary mt-2" onclick="demoBlock()">Demo is read-only</button>`}
-        <div id="bd-results" class="mt-3"></div>
-      </div>
-    </div>
-  `, 'brain-dump'));
-}
-
-window.runBrainDump = async function() {
-  const text = document.getElementById('bd-text')?.value;
-  if (!text) return;
-  const results = document.getElementById('bd-results');
-  results.innerHTML = `<div class="loading-state"><div class="spinner"></div></div>`;
-  // Build roster name list (load if not cached)
-  if (!state.roster) {
-    const data = await api('GET', 'students');
-    state.roster = data.roster || { hs: { core:[], loose:[], fringe:[] }, ms: { core:[], loose:[], fringe:[] } };
-  }
-  const names = [];
-  for (const sk of ['hs','ms']) for (const sec of ['core','loose','fringe']) {
-    (state.roster[sk]?.[sec]||[]).forEach(s => names.push(s.name));
-  }
-  const data = await api('POST', 'brain-dump', { text, roster: names });
-  const parsed = data.parsed || [];
-  if (!parsed.length) { results.innerHTML = `<p class="text-muted text-sm">No student names found. Try mentioning students by name.</p>`; return; }
-  results.innerHTML = `<h3 class="mb-2">Found ${parsed.length} mention${parsed.length !== 1 ? 's' : ''}</h3>` + parsed.map(p => `
-    <div class="card card-body mb-2">
-      <div class="flex items-center justify-between mb-2">
-        <strong>${esc(p.name)}</strong>
-        ${!state.isDemoMode ? `<button class="btn btn-primary btn-sm" onclick="saveBrainDumpNote('${esc(p.name)}','${esc(p.summary.replace(/'/g,"\\'"))}')">Save Note</button>` : ''}
-      </div>
-      <p class="text-sm text-muted">${esc(p.summary)}</p>
-    </div>
-  `).join('');
-};
-
-window.saveBrainDumpNote = async function(name, summary) {
-  // Load roster if not yet cached
-  if (!state.roster) {
-    const data = await api('GET', 'students');
-    state.roster = data.roster || { hs: { core:[], loose:[], fringe:[] }, ms: { core:[], loose:[], fringe:[] } };
-  }
-  // Find student in roster
-  let found = null;
-  for (const sk of ['hs','ms']) for (const sec of ['core','loose','fringe']) {
-    found = (state.roster[sk]?.[sec]||[]).find(s => s.name === name);
-    if (found) break; if (found) break;
-  }
-  if (!found) { toast('Student not found in roster', 'error'); return; }
-  const interaction = {
-    id: crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(),
-    summary, leader: state.user?.name || '', leaderEmail: state.user?.email || '',
-    date: new Date().toISOString().slice(0,10), tags: [], createdAt: new Date().toISOString(),
-  };
-  await api('POST', 'student/interactions', { sk: found.sk||'hs', section: found.section||'core', index: found.index||0, interaction, studentName: found.name });
-  toast(`Note saved for ${name}`, 'success');
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ATTENDANCE
-// ═══════════════════════════════════════════════════════════════
-
-async function renderAttendance() {
-  mount(appShell(`<div class="loading-state"><div class="spinner"></div></div>`, 'attendance'));
-
-  const [currentRes, eventsRes] = await Promise.allSettled([
-    api('GET', 'attendance/checkin/current'),
-    api('GET', 'attendance/events'),
-  ]);
-
-  const current = currentRes.status === 'fulfilled' ? currentRes.value : {};
-  const event = current.event || null;
-  const groups = current.groups || [];
-  const events = eventsRes.status === 'fulfilled' ? (eventsRes.value.events || []) : [];
-
-  const draft = {};
-  for (const group of groups) {
-    for (const student of group.students || []) {
-      draft[student.studentId] = {
-        present: student.present === true,
-        note: student.note || '',
-        studentId: student.studentId,
-      };
-    }
-  }
-
-  async function markAttendanceNotificationsRead() {
-    try {
-      await api('POST', 'notifications/read', {});
-      state.notifications = null;
-    } catch (_) {}
-  }
-
-  function attendanceSummary() {
-    const rows = Object.values(draft);
-    const presentCount = rows.filter(r => r.present).length;
-    return { total: rows.length, presentCount, absentCount: Math.max(0, rows.length - presentCount) };
-  }
-
-  function renderGroupsHtml() {
-    if (!groups.length) {
-      return `<div class="empty-state"><div class="empty-icon">👥</div><div class="empty-title">No assigned groups yet</div><p class="empty-desc">Ask an admin to assign you to a small group in AdminLand.</p></div>`;
-    }
-
-    return groups.map(group => `
-      <div class="card mb-3">
-        <div class="card-header">
-          <h3>${esc(group.groupName || 'Group')}</h3>
-          <span class="text-sm text-muted">${(group.students || []).length} students</span>
-        </div>
-        <div class="card-body">
-          <div class="attendance-grid">
-            ${(group.students || []).map(student => {
-              const row = draft[student.studentId] || { present: false, note: '' };
-              return `
-                <div class="attendance-student ${row.present ? 'present' : 'absent'}" onclick="toggleAttendanceStudent('${esc(student.studentId)}')">
-                  <div class="student-avatar" style="width:42px;height:42px">
-                    ${student.photoUrl ? `<img src="${esc(student.photoUrl)}" alt="${esc(student.name)}">` : esc(student.name.charAt(0).toUpperCase())}
-                  </div>
-                  <div style="flex:1;min-width:0">
-                    <div class="student-name">${esc(student.name)}</div>
-                    <div class="text-xs text-muted">${row.present ? 'Here tonight' : 'Not marked here'}</div>
-                    <input
-                      class="form-input"
-                      style="margin-top:.35rem;font-size:.75rem;padding:.35rem .5rem"
-                      placeholder="Optional note"
-                      value="${esc(row.note || '')}"
-                      onclick="event.stopPropagation()"
-                      oninput="setAttendanceNote('${esc(student.studentId)}',this.value)"
-                    >
-                  </div>
-                  <span class="badge ${row.present ? 'badge-green' : 'badge-gray'}">${row.present ? 'Present' : 'Absent'}</span>
-                </div>
-              `;
-            }).join('')}
-          </div>
-
-          <div class="divider"></div>
-          <div class="flex gap-2" style="align-items:flex-end;flex-wrap:wrap">
-            <div class="form-group" style="margin:0;min-width:180px;flex:1">
-              <label class="form-label">Guest name</label>
-              <input class="form-input" id="guest-name-${esc(group.groupId || 'none')}" placeholder="Guest full name">
-            </div>
-            <div class="form-group" style="margin:0;min-width:220px;flex:2">
-              <label class="form-label">Guest note (optional)</label>
-              <input class="form-input" id="guest-note-${esc(group.groupId || 'none')}" placeholder="How they connected tonight">
-            </div>
-            <button class="btn btn-secondary btn-sm" onclick="addAttendanceGuest('${esc(group.groupId || '')}')">+ Add Guest</button>
-          </div>
-        </div>
-      </div>
-    `).join('');
-  }
-
-  function renderAttendancePage() {
-    const summary = attendanceSummary();
-    document.getElementById('main-content').innerHTML = `
-      <div class="page">
-        <div class="flex items-center justify-between mb-3" style="flex-wrap:wrap;gap:.75rem">
-          <div>
-            <h1>Attendance</h1>
-            <p class="text-sm text-muted mt-1">${event ? `${formatDate(event.event_date_local || event.starts_at_utc)} · ${event.status || 'open'}` : 'No active attendance event yet.'}</p>
-          </div>
-          <div class="flex gap-2">
-            <button class="btn btn-secondary btn-sm" onclick="renderAttendance()">Refresh</button>
-            ${event ? `<button class="btn btn-primary btn-sm" onclick="saveAttendanceRecords()">Save Attendance</button>` : ''}
-          </div>
-        </div>
-
-        ${event ? `
-          <div class="stats-grid mb-3">
-            <div class="stat-card"><div class="stat-value">${summary.total}</div><div class="stat-label">Students in your groups</div></div>
-            <div class="stat-card"><div class="stat-value">${summary.presentCount}</div><div class="stat-label">Marked present</div></div>
-            <div class="stat-card"><div class="stat-value">${summary.absentCount}</div><div class="stat-label">Marked absent</div></div>
-          </div>
-          ${renderGroupsHtml()}
-        ` : `
-          <div class="empty-state">
-            <div class="empty-icon">🗓️</div>
-            <div class="empty-title">No active attendance session</div>
-            <p class="empty-desc">An admin can configure recurring event day/time in AdminLand. Once it opens, your check-in view will appear here.</p>
-          </div>
-        `}
-
-        <div class="card mt-3">
-          <div class="card-header"><h3>Recent Attendance Events</h3></div>
-          <div class="card-body">
-            ${(events || []).length ? `
-              <div class="table-wrap">
-                <table>
-                  <thead><tr><th>Date</th><th>Status</th><th>Present</th><th>Total</th></tr></thead>
-                  <tbody>
-                    ${events.slice(0, 10).map(ev => `
-                      <tr>
-                        <td class="text-sm">${formatDate(ev.event_date_local || ev.starts_at_utc)}</td>
-                        <td><span class="badge ${ev.status === 'open' ? 'badge-blue' : 'badge-gray'}">${esc(ev.status || 'open')}</span></td>
-                        <td class="text-sm">${safeNum(ev.presentCount)}</td>
-                        <td class="text-sm">${safeNum(ev.totalRecords)}</td>
-                      </tr>
-                    `).join('')}
-                  </tbody>
-                </table>
-              </div>
-            ` : `<p class="text-sm text-muted">No attendance history yet.</p>`}
-          </div>
-        </div>
-      </div>
-    `;
-  }
-
-  window.toggleAttendanceStudent = function(studentId) {
-    if (!draft[studentId]) return;
-    draft[studentId].present = !draft[studentId].present;
-    renderAttendancePage();
-  };
-
-  window.setAttendanceNote = function(studentId, note) {
-    if (!draft[studentId]) return;
-    draft[studentId].note = note;
-  };
-
-  window.saveAttendanceRecords = async function() {
-    if (!event) return;
-    if (demoBlock()) return;
-    const records = Object.values(draft).map(row => ({
-      studentId: row.studentId,
-      present: !!row.present,
-      note: (row.note || '').trim() || null,
-    }));
-    const data = await api('POST', `attendance/events/${event.id}/records`, { records });
-    if (data.success) {
-      toast(`Saved attendance for ${data.saved || records.length} students`, 'success');
-      await markAttendanceNotificationsRead();
-      renderAttendance();
-    } else {
-      toast(data.error || 'Could not save attendance', 'error');
-    }
-  };
-
-  window.addAttendanceGuest = async function(groupId) {
-    if (!event) return;
-    if (demoBlock()) return;
-
-    const safeGroupId = groupId || 'none';
-    const nameEl = document.getElementById(`guest-name-${safeGroupId}`);
-    const noteEl = document.getElementById(`guest-note-${safeGroupId}`);
-    const guestName = nameEl?.value?.trim();
-    const note = noteEl?.value?.trim() || '';
-
-    if (!guestName) {
-      toast('Guest name is required', 'error');
-      return;
-    }
-
-    const data = await api('POST', `attendance/events/${event.id}/guests`, { groupId: groupId || null, guestName, note });
-    if (data.success) {
-      toast('Guest saved', 'success');
-      if (nameEl) nameEl.value = '';
-      if (noteEl) noteEl.value = '';
-    } else {
-      toast(data.error || 'Could not save guest', 'error');
-    }
-  };
-
-  await markAttendanceNotificationsRead();
-  renderAttendancePage();
-}
-
-function safeNum(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
-}
-
-// ═══════════════════════════════════════════════════════════════
-// BILLING
-// ═══════════════════════════════════════════════════════════════
-
-function renderBilling() {
-  mount(appShell(`
-    <div class="page">
-      <h1>Billing</h1>
-      ${state.isDemoMode ? `<div class="demo-banner mt-2 mb-3" style="border-radius:var(--radius)">Billing is not available in demo mode.</div>` : ''}
-      <div class="card mb-3">
-        <div class="card-header"><h3>Current Plan</h3></div>
-        <div class="card-body">
-          <div class="flex items-center gap-3 mb-3">
-            <div>
-              <div class="font-bold" style="font-size:1.1rem">Starter</div>
-              <div class="text-sm text-muted">Free plan · Up to 50 students</div>
-            </div>
-            <span class="badge badge-green" style="margin-left:auto">Active</span>
-          </div>
-          <a href="https://storytrackr.app/pricing" class="btn btn-primary btn-sm">Upgrade Plan</a>
-        </div>
-      </div>
-      <div class="card">
-        <div class="card-header"><h3>Plan Comparison</h3></div>
-        <div class="card-body">
-          <p class="text-sm text-muted mb-2">Compare plans on our <a href="https://storytrackr.app/pricing" target="_blank">pricing page</a> or contact us at <a href="mailto:billing@storytrackr.app">billing@storytrackr.app</a> for questions.</p>
-        </div>
-      </div>
-    </div>
-  `, 'settings'));
-}
-
-// ═══════════════════════════════════════════════════════════════
-// LOG HANGOUT MODAL
-// ═══════════════════════════════════════════════════════════════
-
-window.openLogModal = function(studentId, studentName, sk, section, index) {
-  if (demoBlock()) return;
-
-  // Build student selector options if no specific student
-  let studentOptions = '';
-  if (!studentId && state.roster) {
-    for (const s of ['hs','ms']) for (const sec of ['core','loose','fringe']) {
-      (state.roster[s]?.[sec]||[]).forEach(st => {
-        studentOptions += `<option value="${esc(st.id)}|${esc(st.sk||s)}|${esc(st.section||sec)}|${st.index||0}|${esc(st.name)}">${esc(st.name)}</option>`;
-      });
-    }
-  }
-
-  showModal(`
-    <div class="modal-header">
-      <h2 class="modal-title">Add Note</h2>
-      <button class="modal-close" onclick="closeModal()">✕</button>
-    </div>
-    <div class="modal-body">
-      <form class="form-stack" id="log-form">
-        ${studentId ? `<input type="hidden" name="studentId" value="${esc(studentId)}"><input type="hidden" name="sk" value="${esc(sk)}"><input type="hidden" name="section" value="${esc(section)}"><input type="hidden" name="index" value="${index}"><div class="form-group"><label class="form-label">Student</label><input class="form-input" value="${esc(studentName)}" readonly></div>` : `
-          <div class="form-group">
-            <label class="form-label">Student</label>
-            <select class="form-input form-select" name="studentSelect" required>
-              <option value="">Select student…</option>
-              ${studentOptions}
-            </select>
-          </div>`}
-        <div class="form-group">
-          <label class="form-label">Date</label>
-          <input class="form-input" type="date" name="date" value="${new Date().toISOString().slice(0,10)}" required>
-        </div>
-        <div class="form-group">
-          <label class="form-label">Summary *</label>
-          <textarea class="form-input form-textarea" name="summary" placeholder="What did you talk about? What was on their heart?" required></textarea>
-        </div>
-        <div id="log-error" class="form-error hidden"></div>
-      </form>
-    </div>
-    <div class="modal-footer">
-      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="submitLogForm()">Save note</button>
-    </div>
-  `);
-};
-
-window.submitLogForm = async function() {
-  const form = document.getElementById('log-form');
-  const err  = document.getElementById('log-error');
-  const fd   = new FormData(form);
-  let sk, section, index, studentName, studentId;
-
-  if (fd.get('studentSelect')) {
-    const parts = fd.get('studentSelect').split('|');
-    studentId = parts[0]; sk = parts[1]; section = parts[2]; index = parseInt(parts[3]); studentName = parts[4];
-  } else {
-    studentId = fd.get('studentId'); sk = fd.get('sk'); section = fd.get('section'); index = parseInt(fd.get('index'));
-    // find name from roster
-    if (state.roster) {
-      for (const s of ['hs','ms']) for (const sec of ['core','loose','fringe']) {
-        const found = (state.roster[s]?.[sec]||[]).find(st => st.id === studentId);
-        if (found) { studentName = found.name; break; }
-      }
-    }
-  }
-
-  const summary = fd.get('summary');
-  if (!summary) { err.textContent = 'Summary required'; err.classList.remove('hidden'); return; }
-
-  const interaction = {
-    id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-    summary, leader: state.user?.name || '', leaderEmail: state.user?.email || '',
-    date: fd.get('date'), tags: [], createdAt: new Date().toISOString(),
-  };
-
-  const data = await api('POST', 'student/interactions', { sk, section, index, interaction, studentName });
-  if (data.success) {
-    closeModal();
-    toast('Note saved!', 'success');
-    state.roster = null; // invalidate cache
-    state.activity = null;
-  } else {
-    err.textContent = data.error || 'Failed to save'; err.classList.remove('hidden');
-  }
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADD STUDENT MODAL
-// ═══════════════════════════════════════════════════════════════
-
-window.openAddStudentModal = function() {
-  if (demoBlock()) return;
-  showModal(`
-    <div class="modal-header">
-      <h2 class="modal-title">Add Student</h2>
-      <button class="modal-close" onclick="closeModal()">✕</button>
-    </div>
-    <div class="modal-body">
-      <form class="form-stack" id="add-student-form">
-        <div class="form-group">
-          <label class="form-label">Full name *</label>
-          <input class="form-input" name="name" placeholder="First Last" required>
-        </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
-          <div class="form-group">
-            <label class="form-label">Grade</label>
-            <input class="form-input" name="grade" type="number" min="6" max="12" placeholder="10">
-          </div>
-          <div class="form-group">
-            <label class="form-label">Division</label>
-            <select class="form-input form-select" name="sk">
-              <option value="hs">High School</option>
-              <option value="ms">Middle School</option>
-            </select>
-          </div>
-        </div>
-        <div class="form-group">
-          <label class="form-label">School</label>
-          <input class="form-input" name="school" placeholder="Lincoln High">
-        </div>
-        <div class="form-group">
-          <label class="form-label">Birthday</label>
-          <input class="form-input" type="date" name="birthday">
-        </div>
-        <div id="add-student-error" class="form-error hidden"></div>
-      </form>
-    </div>
-    <div class="modal-footer">
-      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="submitAddStudent()">Add student</button>
-    </div>
-  `);
-};
-
-window.submitAddStudent = async function() {
-  const form = document.getElementById('add-student-form');
-  const err  = document.getElementById('add-student-error');
-  const fd   = new FormData(form);
-  if (!fd.get('name')) { err.textContent = 'Name required'; err.classList.remove('hidden'); return; }
-  const data = await api('POST', 'students', {
-    name: fd.get('name'), grade: fd.get('grade') ? Number(fd.get('grade')) : null,
-    sk: fd.get('sk') || 'hs', section: 'core', school: fd.get('school'), birthday: fd.get('birthday'),
   });
-  if (data.success) { closeModal(); toast('Student added', 'success'); state.roster = null; renderStudentsView(); }
-  else { err.textContent = data.error || 'Failed'; err.classList.remove('hidden'); }
-};
-
-// ═══════════════════════════════════════════════════════════════
-// MODAL HELPERS
-// ═══════════════════════════════════════════════════════════════
-
-function showModal(html) {
-  closeModal();
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  overlay.id = 'modal-overlay';
-  overlay.innerHTML = `<div class="modal">${html}</div>`;
-  overlay.addEventListener('click', e => { if (e.target === overlay) closeModal(); });
-  document.body.appendChild(overlay);
 }
-window.closeModal = function() { document.getElementById('modal-overlay')?.remove(); };
 
-// ═══════════════════════════════════════════════════════════════
-// UTILITY HELPERS
-// ═══════════════════════════════════════════════════════════════
+// ── Security: HTML escaping ───────────────────────────────────────────────────
 
-function formatDate(dateStr) {
-  if (!dateStr) return '';
+function escHtml(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// ── Demo auto-login (P2) ───────────────────────────────────────────────────────
+
+async function checkDemoParam() {
+  const params = new URLSearchParams(window.location.search);
+  const demoToken = params.get('demo');
+  if (!demoToken) return false;
+
   try {
-    const d = new Date(dateStr);
-    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-  } catch (_) { return dateStr; }
-}
-
-function formatBirthday(dateStr) {
-  if (!dateStr) return '';
-  try {
-    const d = new Date(dateStr + (dateStr.length === 10 ? 'T00:00:00' : ''));
-    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    return `${months[d.getMonth()]} ${d.getDate()}`;
-  } catch (_) { return ''; }
-}
-
-function calcAge(dateStr) {
-  if (!dateStr) return null;
-  try {
-    const dob = new Date(dateStr + (dateStr.length === 10 ? 'T00:00:00' : ''));
-    const now = new Date();
-    let age = now.getFullYear() - dob.getFullYear();
-    if (now < new Date(now.getFullYear(), dob.getMonth(), dob.getDate())) age--;
-    return age;
-  } catch (_) { return null; }
-}
-
-// ═══════════════════════════════════════════════════════════════
-// THEME / APPEARANCE
-// ═══════════════════════════════════════════════════════════════
-
-function applyTheme(prefs) {
-  const p = prefs || {};
-  const theme = p.theme || 'auto';
-  if (theme === 'dark') {
-    document.documentElement.dataset.theme = 'dark';
-  } else if (theme === 'light') {
-    document.documentElement.dataset.theme = 'light';
-  } else {
-    // auto — follow system
-    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    document.documentElement.dataset.theme = prefersDark ? 'dark' : 'light';
+    const data = await tryDemoLogin(demoToken);
+    STATE.session = { orgId: data.orgId, role: 'readonly', readonly: true };
+    STATE.canEdit = false;
+    enterApp({ email: '', readonly: true });
+    // Clean up URL
+    window.history.replaceState({}, '', window.location.pathname);
+    return true;
+  } catch (err) {
+    showToast(`Demo login failed: ${err.message}`, 'error');
+    return false;
   }
-  document.body.classList.toggle('compact', !!p.compactMode);
-  document.body.classList.toggle('no-sticky-nav', p.stickyBottomNav === false);
 }
 
-// ═══════════════════════════════════════════════════════════════
-// CROP MODAL (Phase 6)
-// ═══════════════════════════════════════════════════════════════
+// ── Init ────────────────────────────────────────────────────────────────────
 
-function openCropModal(file, onCropComplete) {
-  const url = URL.createObjectURL(file);
-  showModal(`
-    <div class="modal-header">
-      <h2 class="modal-title">Crop Photo</h2>
-      <button class="modal-close" onclick="closeModal()">✕</button>
-    </div>
-    <div class="modal-body" style="text-align:center">
-      <div style="position:relative;overflow:hidden;width:260px;height:260px;margin:0 auto;border-radius:50%;border:2px solid var(--border);cursor:move;background:#000" id="crop-container">
-        <img id="crop-img" src="${url}" style="position:absolute;top:0;left:0;transform-origin:top left;user-select:none;max-width:none">
-      </div>
-      <p class="text-sm text-muted mt-2">Drag to reposition · Scroll to zoom</p>
-    </div>
-    <div class="modal-footer">
-      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="cropAndComplete()">Use Photo</button>
-    </div>
-  `);
+async function init() {
+  // Wire login tabs
+  initLoginTabs();
 
-  let scale = 1, ox = 0, oy = 0, dragging = false, startX, startY;
-  const img = document.getElementById('crop-img');
-  const container = document.getElementById('crop-container');
-  const SIZE = 260;
+  // Login form events
+  els.loginForm.addEventListener('submit', handleLeaderLoginSubmit);
+  els.passcodeForm.addEventListener('submit', handlePasscodeSubmit);
+  els.forgotBtn.addEventListener('click', handleForgotPassword);
 
-  img.onload = () => {
-    scale = Math.max(SIZE / img.naturalWidth, SIZE / img.naturalHeight);
-    ox = (SIZE - img.naturalWidth * scale) / 2;
-    oy = (SIZE - img.naturalHeight * scale) / 2;
-    updateTransform();
-  };
+  // App events
+  els.logoutBtn.addEventListener('click', handleLogout);
+  els.addStudentBtn.addEventListener('click', () => openStudentModal());
 
-  function updateTransform() {
-    img.style.transform = `translate(${ox}px,${oy}px) scale(${scale})`;
-  }
+  // School tabs
+  document.querySelectorAll('.school-tab').forEach(btn => {
+    btn.addEventListener('click', () => setSchoolTab(btn.dataset.school));
+  });
 
-  container.addEventListener('mousedown', e => { dragging = true; startX = e.clientX - ox; startY = e.clientY - oy; });
-  window.addEventListener('mousemove', e => { if (!dragging) return; ox = e.clientX - startX; oy = e.clientY - startY; updateTransform(); });
-  window.addEventListener('mouseup', () => { dragging = false; });
-  container.addEventListener('wheel', e => {
-    e.preventDefault();
-    const delta = e.deltaY < 0 ? 1.1 : 0.9;
-    scale = Math.max(SIZE / img.naturalWidth, scale * delta);
-    updateTransform();
-  }, { passive: false });
+  // Student form modal
+  els.studentForm.addEventListener('submit', handleStudentFormSubmit);
+  els.studentModalClose.addEventListener('click', closeStudentModal);
+  els.studentModalCancel.addEventListener('click', closeStudentModal);
+  els.studentModal.addEventListener('click', e => { if (e.target === els.studentModal) closeStudentModal(); });
 
-  window.cropAndComplete = function() {
-    const canvas = document.createElement('canvas');
-    canvas.width = canvas.height = SIZE;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(img, -ox / scale, -oy / scale, SIZE / scale, SIZE / scale, 0, 0, SIZE, SIZE);
-    canvas.toBlob(blob => {
-      closeModal();
-      URL.revokeObjectURL(url);
-      onCropComplete(blob);
-    }, 'image/jpeg', 0.9);
-  };
-}
+  // Detail modal
+  els.detailModalClose.addEventListener('click', closeDetailModal);
+  els.detailModal.addEventListener('click', e => { if (e.target === els.detailModal) closeDetailModal(); });
 
-// ═══════════════════════════════════════════════════════════════
-// ADMINLAND (Phase 4)
-// ═══════════════════════════════════════════════════════════════
+  // Keyboard: close modals on Escape
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { closeStudentModal(); closeDetailModal(); }
+  });
 
-async function renderAdminLand() {
-  const role = state.user?.role || state.user?.orgRole;
-  if (role !== 'admin') {
-    mount(appShell(`
-      <div class="page">
-        <div class="empty-state">
-          <div class="empty-icon">🔒</div>
-          <div class="empty-title">Admin access required</div>
-          <p class="empty-desc">Contact your admin for access.</p>
-        </div>
-      </div>
-    `, 'adminland'));
-    return;
-  }
+  // Check for demo token in URL (P2 fix)
+  const autologgedIn = await checkDemoParam();
 
-  mount(appShell(`<div class="loading-state"><div class="spinner"></div></div>`, 'adminland'));
-
-  const [usersRes, settingsRes, analyticsRes, schedulesRes, groupsRes, studentsRes] = await Promise.allSettled([
-    api('GET', 'admin/users'),
-    api('GET', `settings/public?orgId=${encodeURIComponent(state.user?.orgId||'default')}`),
-    api('GET', 'admin/analytics'),
-    api('GET', 'admin/attendance-schedule'),
-    api('GET', 'admin/groups'),
-    api('GET', 'students'),
-  ]);
-
-  const users    = usersRes.status === 'fulfilled' ? (usersRes.value.users || []) : [];
-  const settings = settingsRes.status === 'fulfilled' ? settingsRes.value : {};
-  const analytics= analyticsRes.status === 'fulfilled' ? analyticsRes.value : {};
-  const schedules = schedulesRes.status === 'fulfilled' ? (schedulesRes.value.schedules || []) : [];
-  const groups = groupsRes.status === 'fulfilled' ? (groupsRes.value.groups || []) : [];
-  const roster = studentsRes.status === 'fulfilled'
-    ? (studentsRes.value.roster || { hs: { core: [], loose: [], fringe: [] }, ms: { core: [], loose: [], fringe: [] } })
-    : { hs: { core: [], loose: [], fringe: [] }, ms: { core: [], loose: [], fringe: [] } };
-  const allStudents = [];
-  for (const sk of ['hs', 'ms']) for (const sec of ['core', 'loose', 'fringe']) {
-    (roster[sk]?.[sec] || []).forEach(s => allStudents.push(s));
-  }
-  if (settingsRes.status === 'fulfilled') state.settings = settings;
-
-  const features  = settings.features  || { goals:true, notes:true, activity:true, familyContact:true };
-  const statCards = settings.statCards || { totalStudents:true, totalInteractions:true, interactionsThisMonth:true, activeLeaders:true };
-
-  document.getElementById('main-content').innerHTML = `
-    <div class="page">
-      <h1>AdminLand</h1>
-      <p class="text-muted mt-1 mb-4">Manage your ministry settings, leaders, and data.</p>
-
-      <!-- Ministry Controls -->
-      <div class="card mb-3">
-        <div class="card-header"><h3>Ministry Controls</h3></div>
-        <div class="card-body">
-          <form class="form-stack" onsubmit="saveAdminSettings(event)">
-            <div class="form-group">
-              <label class="form-label">Ministry name</label>
-              <input class="form-input" id="admin-ministry-name" value="${esc(settings.ministryName||'')}">
-            </div>
-            <button class="btn btn-primary btn-sm" type="submit" style="align-self:flex-start">Save Name</button>
-          </form>
-          <hr class="divider mt-3 mb-3">
-          <div class="flex gap-2 flex-wrap">
-            <button class="btn btn-secondary btn-sm" onclick="archiveGraduates()">Archive Grade-12 Students</button>
-            <button class="btn btn-danger btn-sm" onclick="confirmDeleteMinistry()">Delete Ministry…</button>
-          </div>
-        </div>
-      </div>
-
-      <!-- Data Visibility -->
-      <div class="card mb-3">
-        <div class="card-header"><h3>Data Visibility</h3></div>
-        <div class="card-body">
-          <p class="text-sm text-muted mb-3">Control which features are visible to all leaders.</p>
-          <div style="display:flex;flex-direction:column;gap:.6rem">
-            ${[
-              ['goals','Goals / Spiritual Goals'],
-              ['notes','Notes'],
-              ['activity','Activity feed'],
-              ['familyContact','Family Contacted toggle'],
-            ].map(([k,label]) => `
-              <label style="display:flex;align-items:center;gap:.5rem;font-size:.9rem;cursor:pointer">
-                <input type="checkbox" id="feat-${k}" ${features[k]?'checked':''} onchange="saveFeature('${k}',this.checked)">
-                ${label}
-              </label>
-            `).join('')}
-          </div>
-          <hr class="divider mt-3 mb-3">
-          <p class="text-sm text-muted mb-2">Stat cards shown on the Students page:</p>
-          <div style="display:flex;flex-direction:column;gap:.6rem">
-            ${[
-              ['totalStudents','Total Students'],
-              ['totalInteractions','Total Interactions'],
-              ['interactionsThisMonth','This Month'],
-              ['activeLeaders','Active Leaders'],
-            ].map(([k,label]) => `
-              <label style="display:flex;align-items:center;gap:.5rem;font-size:.9rem;cursor:pointer">
-                <input type="checkbox" id="sc-${k}" ${statCards[k]?'checked':''} onchange="saveStatCard('${k}',this.checked)">
-                ${label}
-              </label>
-            `).join('')}
-          </div>
-        </div>
-      </div>
-
-      <!-- Attendance Settings -->
-      <div class="card mb-3">
-        <div class="card-header"><h3>Attendance Settings</h3></div>
-        <div class="card-body">
-          <form class="form-stack mb-3" onsubmit="saveAttendanceSchedule(event)">
-            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:.75rem">
-              <div class="form-group" style="margin:0">
-                <label class="form-label">Event day</label>
-                <select class="form-input form-select" id="attendance-weekday">
-                  ${['sunday','monday','tuesday','wednesday','thursday','friday','saturday'].map(day => `<option value="${day}" ${(schedules[0]?.weekday || settings.meetingDay || 'wednesday') === day ? 'selected' : ''}>${day.charAt(0).toUpperCase() + day.slice(1)}</option>`).join('')}
-                </select>
-              </div>
-              <div class="form-group" style="margin:0">
-                <label class="form-label">Start time (local)</label>
-                <input class="form-input" type="time" id="attendance-start" value="${esc((schedules[0]?.start_time_local || '19:00:00').slice(0,5))}">
-              </div>
-              <div class="form-group" style="margin:0">
-                <label class="form-label">Timezone</label>
-                <input class="form-input" id="attendance-timezone" value="${esc(schedules[0]?.timezone || settings.timezone || 'America/Chicago')}" placeholder="America/Chicago">
-              </div>
-            </div>
-            <label style="display:flex;align-items:center;gap:.5rem;font-size:.875rem">
-              <input type="checkbox" id="attendance-active" ${schedules[0]?.active === false ? '' : 'checked'}>
-              Attendance schedule is active
-            </label>
-            <button class="btn btn-primary btn-sm" type="submit" style="align-self:flex-start">Save Attendance Schedule</button>
-          </form>
-
-          <hr class="divider mt-3 mb-3">
-          <h4 style="font-size:.9rem;font-weight:600;margin-bottom:.5rem">Small Groups</h4>
-          <form class="flex gap-2 mb-2" style="flex-wrap:wrap" onsubmit="createSmallGroup(event)">
-            <input class="form-input" name="name" placeholder="Group name (e.g., HS Girls 10th)" style="min-width:220px;flex:2" required>
-            <select class="form-input form-select" name="sk" style="min-width:120px;flex:1">
-              <option value="hs">High School</option>
-              <option value="ms">Middle School</option>
-            </select>
-            <select class="form-input form-select" name="section" style="min-width:120px;flex:1">
-              <option value="core">Core</option>
-              <option value="loose">Loose</option>
-              <option value="fringe">Fringe</option>
-            </select>
-            <button class="btn btn-secondary btn-sm" type="submit">+ Add Group</button>
-          </form>
-
-          ${groups.length ? `
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th>Group</th><th>Track</th><th>Leaders</th><th>Status</th><th>Actions</th></tr></thead>
-                <tbody>
-                  ${groups.map(g => `
-                    <tr>
-                      <td class="text-sm">${esc(g.name || '')}</td>
-                      <td class="text-sm">${esc(String(g.sk || 'hs').toUpperCase())} · ${esc(g.section || 'core')}</td>
-                      <td class="text-sm">${(g.leaders || []).length ? g.leaders.map(l => esc(l.name || l.email || 'Leader')).join(', ') : 'None assigned'}</td>
-                      <td><span class="badge ${g.active ? 'badge-green' : 'badge-gray'}">${g.active ? 'Active' : 'Inactive'}</span></td>
-                      <td>
-                        <div class="flex gap-2">
-                          <button class="btn btn-ghost btn-sm" onclick="toggleGroupActive('${esc(g.id)}',${g.active ? 'false' : 'true'})">${g.active ? 'Deactivate' : 'Activate'}</button>
-                          <button class="btn btn-secondary btn-sm" onclick="openAssignLeadersModal('${esc(g.id)}')">Assign Leaders</button>
-                        </div>
-                      </td>
-                    </tr>
-                  `).join('')}
-                </tbody>
-              </table>
-            </div>
-          ` : '<p class=\"text-sm text-muted\">No small groups yet. Add one above to power attendance check-in.</p>'}
-
-          <hr class="divider mt-3 mb-3">
-          <h4 style="font-size:.9rem;font-weight:600;margin-bottom:.5rem">Student Group Assignment</h4>
-          ${allStudents.length ? `
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th>Student</th><th>Track</th><th>Group</th></tr></thead>
-                <tbody>
-                  ${allStudents.slice(0, 120).map(st => `
-                    <tr>
-                      <td class="text-sm">${esc(st.name || '')}</td>
-                      <td class="text-sm">${esc(String(st.sk || 'hs').toUpperCase())} · ${esc(st.section || 'core')}</td>
-                      <td>
-                        <select class="form-input form-select" style="font-size:.8rem;padding:.35rem .5rem;min-width:180px" onchange="assignStudentGroup('${esc(st.id)}',this.value||null)">
-                          <option value="">No group</option>
-                          ${groups
-                            .filter(g => g.sk === st.sk && g.section === st.section)
-                            .map(g => `<option value="${esc(g.id)}" ${st.smallGroupId === g.id ? 'selected' : ''}>${esc(g.name)}</option>`)
-                            .join('')}
-                        </select>
-                      </td>
-                    </tr>
-                  `).join('')}
-                </tbody>
-              </table>
-            </div>
-            ${allStudents.length > 120 ? `<p class=\"text-xs text-muted mt-2\">Showing first 120 students for performance.</p>` : ''}
-          ` : '<p class=\"text-sm text-muted\">No students found yet.</p>'}
-        </div>
-      </div>
-
-      <!-- Leader Analytics -->
-      <div class="card mb-3">
-        <div class="card-header"><h3>Leader Analytics</h3></div>
-        <div class="card-body">
-          <p class="text-sm text-muted mb-3">Total interactions tracked: <strong>${analytics.total ?? '—'}</strong></p>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem">
-            <div>
-              <h4 style="font-size:.85rem;font-weight:600;margin-bottom:.5rem">Top Leaders</h4>
-              ${(analytics.topLeaders||[]).length ? analytics.topLeaders.map(l=>`
-                <div class="flex items-center justify-between" style="padding:.3rem 0;border-bottom:1px solid var(--border)">
-                  <span class="text-sm">${esc(l.name)}</span>
-                  <span class="badge badge-blue">${l.count}</span>
-                </div>`).join('') : '<p class="text-sm text-muted">No data yet</p>'}
-            </div>
-            <div>
-              <h4 style="font-size:.85rem;font-weight:600;margin-bottom:.5rem">Most Connected Students</h4>
-              ${(analytics.topStudents||[]).length ? analytics.topStudents.map(s=>`
-                <div class="flex items-center justify-between" style="padding:.3rem 0;border-bottom:1px solid var(--border)">
-                  <span class="text-sm">${esc(s.name)}</span>
-                  <span class="badge badge-green">${s.count}</span>
-                </div>`).join('') : '<p class="text-sm text-muted">No data yet</p>'}
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Invite Leaders -->
-      <div class="card mb-3">
-        <div class="card-header"><h3>Invite Leaders</h3></div>
-        <div class="card-body">
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem">
-            <div>
-              <h4 style="font-size:.9rem;font-weight:600;margin-bottom:.5rem">Email Invite</h4>
-              <form class="form-stack" onsubmit="sendManualInvite(event)">
-                <input class="form-input" name="inviteName" placeholder="Their name" required style="font-size:.85rem">
-                <input class="form-input" type="email" name="inviteEmail" placeholder="their@email.com" required style="font-size:.85rem">
-                <button class="btn btn-secondary btn-sm" type="submit">Send Invite</button>
-              </form>
-            </div>
-            <div>
-              <h4 style="font-size:.9rem;font-weight:600;margin-bottom:.5rem">QR / Link Invite</h4>
-              <button class="btn btn-secondary btn-sm" onclick="generateQrInvite()">Generate Invite Link</button>
-              <div id="qr-invite-result" class="mt-2"></div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Leader Management -->
-      <div class="card">
-        <div class="card-header"><h3>Leaders (${users.length})</h3></div>
-        <div class="card-body">
-          ${users.length ? `
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead>
-                <tbody>
-                  ${users.map(u => `
-                    <tr>
-                      <td class="text-sm">${esc(u.name||'')}</td>
-                      <td class="text-sm">${esc(u.email||'')}</td>
-                      <td><span class="badge badge-blue">${esc(u.role||'')}</span></td>
-                      <td><span class="badge ${u.status==='approved'?'badge-green':'badge-gray'}">${esc(u.status||'pending')}</span></td>
-                      <td>
-                        ${u.email !== state.user?.email ? `
-                          <div class="flex gap-2">
-                            ${u.status !== 'approved' ? `<button class="btn btn-primary btn-sm" onclick="updateLeader('${esc(u.email)}','${esc(u.role||'leader')}','approved',true)">Approve</button>` : ''}
-                            <button class="btn btn-ghost btn-sm" onclick="showUpdateLeaderModal('${esc(u.email)}','${esc(u.role||'leader')}','${esc(u.status||'')}')">Edit</button>
-                          </div>
-                        ` : '<span class="text-sm text-muted">You</span>'}
-                      </td>
-                    </tr>
-                  `).join('')}
-                </tbody>
-              </table>
-            </div>
-          ` : '<p class="text-sm text-muted">No leaders yet.</p>'}
-        </div>
-      </div>
-    </div>
-  `;
-
-  window.saveAdminSettings = async function(e) {
-    e.preventDefault();
-    const name = document.getElementById('admin-ministry-name').value;
-    await api('POST', 'settings', { ministryName: name });
-    toast('Ministry name saved', 'success');
-  };
-
-  window.saveFeature = async function(key, val) {
-    const current = state.settings?.features || {};
-    await api('POST', 'settings', { features: { ...current, [key]: val } });
-    if (state.settings) state.settings.features = { ...current, [key]: val };
-  };
-
-  window.saveStatCard = async function(key, val) {
-    const current = state.settings?.statCards || {};
-    await api('POST', 'settings', { statCards: { ...current, [key]: val } });
-    if (state.settings) state.settings.statCards = { ...current, [key]: val };
-  };
-
-  window.saveAttendanceSchedule = async function(e) {
-    e.preventDefault();
-    const payload = {
-      id: schedules[0]?.id || undefined,
-      weekday: document.getElementById('attendance-weekday')?.value || 'wednesday',
-      startTimeLocal: `${document.getElementById('attendance-start')?.value || '19:00'}:00`,
-      timezone: document.getElementById('attendance-timezone')?.value || 'America/Chicago',
-      active: !!document.getElementById('attendance-active')?.checked,
-    };
-    const data = await api('POST', 'admin/attendance-schedule', payload);
-    if (data.success) {
-      await api('POST', 'settings', { timezone: payload.timezone, meetingDay: payload.weekday });
-      toast('Attendance schedule saved', 'success');
-      renderAdminLand();
-    } else {
-      toast(data.error || 'Failed to save schedule', 'error');
-    }
-  };
-
-  window.createSmallGroup = async function(e) {
-    e.preventDefault();
-    const fd = new FormData(e.target);
-    const data = await api('POST', 'admin/groups', {
-      name: fd.get('name'),
-      sk: fd.get('sk'),
-      section: fd.get('section'),
-    });
-    if (data.success) {
-      toast('Small group created', 'success');
-      e.target.reset();
-      renderAdminLand();
-    } else {
-      toast(data.error || 'Failed to create group', 'error');
-    }
-  };
-
-  window.toggleGroupActive = async function(groupId, active) {
-    const data = await api('PUT', `admin/groups/${groupId}`, { active: !!active });
-    if (data.success) {
-      toast('Group updated', 'success');
-      renderAdminLand();
-    } else {
-      toast(data.error || 'Failed to update group', 'error');
-    }
-  };
-
-  window.assignStudentGroup = async function(studentId, groupId) {
-    const data = await api('PUT', `students/${studentId}`, { smallGroupId: groupId || null });
-    if (data.success || data.student) {
-      toast('Student group updated', 'success', 1500);
-      state.roster = null;
-    } else {
-      toast(data.error || 'Could not update student group', 'error');
-    }
-  };
-
-  window.openAssignLeadersModal = function(groupId) {
-    const group = groups.find(g => g.id === groupId);
-    if (!group) return;
-    const current = new Set((group.leaders || []).map(l => l.userId));
-    const options = users
-      .filter(u => (u.status || '').toLowerCase() === 'approved')
-      .map(u => `<label style=\"display:flex;align-items:center;gap:.5rem;font-size:.875rem;margin-bottom:.35rem\"><input type=\"checkbox\" value=\"${esc(u.userId || '')}\" ${current.has(u.userId) ? 'checked' : ''}> ${esc(u.name || u.email || '')} <span class=\"text-muted\">(${esc(u.email || '')})</span></label>`)
-      .join('');
-
-    showModal(`
-      <div class=\"modal-header\"><h2 class=\"modal-title\">Assign Leaders</h2><button class=\"modal-close\" onclick=\"closeModal()\">✕</button></div>
-      <div class=\"modal-body\">
-        <p class=\"text-sm text-muted mb-2\">Group: <strong>${esc(group.name)}</strong></p>
-        <div id=\"leader-checkbox-list\" style=\"max-height:220px;overflow:auto\">${options || '<p class=\"text-sm text-muted\">No approved leaders found.</p>'}</div>
-      </div>
-      <div class=\"modal-footer\">
-        <button class=\"btn btn-ghost\" onclick=\"closeModal()\">Cancel</button>
-        <button class=\"btn btn-primary\" onclick=\"saveAssignedLeaders('${esc(groupId)}')\">Save</button>
-      </div>
-    `);
-  };
-
-  window.saveAssignedLeaders = async function(groupId) {
-    const leaderUserIds = [...document.querySelectorAll('#leader-checkbox-list input[type=\"checkbox\"]:checked')]
-      .map(el => el.value)
-      .filter(Boolean);
-    const data = await api('POST', `admin/groups/${groupId}/leaders`, { leaderUserIds });
-    if (data.success) {
-      closeModal();
-      toast('Group leaders updated', 'success');
-      renderAdminLand();
-    } else {
-      toast(data.error || 'Failed to update leaders', 'error');
-    }
-  };
-
-  window.archiveGraduates = async function() {
-    if (!confirm('Archive all Grade 12 students?')) return;
-    const data = await api('POST', 'admin/archive-graduates');
-    if (data.success) { toast(`Archived ${data.archived} students`, 'success'); state.roster = null; }
-    else toast(data.error || 'Failed', 'error');
-  };
-
-  window.confirmDeleteMinistry = function() {
-    const name = state.settings?.ministryName || state.user?.orgName || '';
-    showModal(`
-      <div class="modal-header"><h2 class="modal-title" style="color:var(--red)">Delete Ministry</h2><button class="modal-close" onclick="closeModal()">✕</button></div>
-      <div class="modal-body">
-        <p class="text-sm text-muted mb-3">This will permanently delete <strong>${esc(name)}</strong> and all its data. This cannot be undone.</p>
-        <div class="form-group">
-          <label class="form-label">Type the ministry name to confirm</label>
-          <input class="form-input" id="delete-confirm-name" placeholder="${esc(name)}">
-        </div>
-        <div id="delete-error" class="form-error hidden"></div>
-      </div>
-      <div class="modal-footer">
-        <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
-        <button class="btn btn-danger" onclick="deleteMinistry('${esc(name)}')">Delete permanently</button>
-      </div>
-    `);
-  };
-
-  window.deleteMinistry = async function(expectedName) {
-    const confirmName = document.getElementById('delete-confirm-name')?.value;
-    if (confirmName !== expectedName) {
-      document.getElementById('delete-error').textContent = 'Name does not match';
-      document.getElementById('delete-error').classList.remove('hidden');
-      return;
-    }
-    const data = await api('DELETE', 'admin/ministry', { confirmName });
-    if (data.success) { closeModal(); toast('Ministry deleted', 'success'); await doLogout(); }
-    else toast(data.error || 'Failed', 'error');
-  };
-
-  window.sendManualInvite = async function(e) {
-    e.preventDefault();
-    const fd = new FormData(e.target);
-    const data = await api('POST', 'admin/invite/manual', { name: fd.get('inviteName'), email: fd.get('inviteEmail') });
-    if (data.success) { toast('Invite sent', 'success'); e.target.reset(); }
-    else toast(data.error || 'Failed', 'error');
-  };
-
-  window.generateQrInvite = async function() {
-    const data = await api('POST', 'admin/invite/qr', {});
-    const result = document.getElementById('qr-invite-result');
-    if (data.inviteLink) {
-      result.innerHTML = `
-        <div style="font-size:.8rem;word-break:break-all;background:var(--surface-2);padding:.5rem;border-radius:var(--radius-sm);margin-bottom:.5rem">${esc(data.inviteLink)}</div>
-        <button class="btn btn-ghost btn-sm" onclick="navigator.clipboard.writeText('${esc(data.inviteLink)}').then(()=>toast('Copied!','success'))">Copy Link</button>
-        <div id="qr-canvas" style="margin-top:.5rem"></div>
-      `;
-      // Load QR code library and render
-      if (!window.QRCode) {
-        const script = document.createElement('script');
-        script.src = 'https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js';
-        script.onload = () => { new window.QRCode(document.getElementById('qr-canvas'), { text: data.inviteLink, width: 128, height: 128 }); };
-        document.head.appendChild(script);
-      } else {
-        new window.QRCode(document.getElementById('qr-canvas'), { text: data.inviteLink, width: 128, height: 128 });
-      }
-    } else { toast(data.error || 'Failed', 'error'); }
-  };
-
-  window.updateLeader = async function(email, role, status, notify) {
-    const data = await api('POST', 'admin/update', { email, role, status, notifyUser: !!notify });
-    if (data.success) { toast('Updated', 'success'); renderAdminLand(); }
-    else toast(data.error || 'Failed', 'error');
-  };
-
-  window.showUpdateLeaderModal = function(email, currentRole, currentStatus) {
-    showModal(`
-      <div class="modal-header"><h2 class="modal-title">Edit Leader</h2><button class="modal-close" onclick="closeModal()">✕</button></div>
-      <div class="modal-body">
-        <p class="text-sm text-muted mb-3">${esc(email)}</p>
-        <div class="form-group">
-          <label class="form-label">Role</label>
-          <select class="form-input form-select" id="edit-role">
-            ${['pending','approved','leader','admin'].map(r => `<option value="${r}" ${r===currentRole?'selected':''}>${r}</option>`).join('')}
-          </select>
-        </div>
-        <div class="form-group">
-          <label class="form-label">Status</label>
-          <select class="form-input form-select" id="edit-status">
-            ${['pending_approval','approved'].map(s => `<option value="${s}" ${s===currentStatus?'selected':''}>${s}</option>`).join('')}
-          </select>
-        </div>
-        <label style="display:flex;align-items:center;gap:.5rem;font-size:.875rem;margin-top:.5rem">
-          <input type="checkbox" id="edit-notify" checked> Notify user by email
-        </label>
-      </div>
-      <div class="modal-footer">
-        <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
-        <button class="btn btn-primary" onclick="updateLeader('${esc(email)}',document.getElementById('edit-role').value,document.getElementById('edit-status').value,document.getElementById('edit-notify').checked);closeModal()">Save</button>
-      </div>
-    `);
-  };
-}
-
-// ═══════════════════════════════════════════════════════════════
-// OWNER DASHBOARD (Phase 5C)
-// ═══════════════════════════════════════════════════════════════
-
-async function renderOwnerDashboard() {
-  mount(`
-    <div class="auth-page">
-      <div class="auth-card card card-body">
-        <div class="auth-logo">StoryTrackr Owner</div>
-        <h1 class="auth-title" style="font-size:1.4rem">Owner Dashboard</h1>
-        <div class="form-group">
-          <label class="form-label">Owner Secret</label>
-          <input class="form-input" type="password" id="owner-secret" placeholder="Bearer token" value="${esc(sessionStorage.getItem('ownerSecret')||'')}">
-        </div>
-        <button class="btn btn-primary btn-full" onclick="loadOwnerData()">Load Ministries</button>
-        <div id="owner-content" class="mt-3"></div>
-      </div>
-    </div>
-  `);
-
-  window.loadOwnerData = async function() {
-    const secret = document.getElementById('owner-secret')?.value;
-    sessionStorage.setItem('ownerSecret', secret);
-    const container = document.getElementById('owner-content');
-    container.innerHTML = `<div class="loading-state"><div class="spinner"></div></div>`;
+  if (!autologgedIn) {
+    // Check if already logged in by probing the roster endpoint
     try {
-      const res = await fetch('/api/owner/ministries', { headers: { 'Authorization': `Bearer ${secret}` } });
-      const data = await res.json();
-      if (!data.ministries) { container.innerHTML = `<p class="text-sm" style="color:var(--red)">${esc(data.error||'Unauthorized')}</p>`; return; }
-      const ms = data.ministries;
-      container.innerHTML = `
-        <p class="text-sm text-muted mb-2">${ms.length} ministries</p>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>Name</th><th>Students</th><th>Leaders</th><th>Activity</th><th>Created</th><th></th></tr></thead>
-            <tbody>
-              ${ms.map(m => `
-                <tr>
-                  <td class="text-sm font-bold">${esc(m.name)}</td>
-                  <td class="text-sm">${m.studentCount}</td>
-                  <td class="text-sm">${m.leaderCount}</td>
-                  <td class="text-sm">${m.activityCount}</td>
-                  <td class="text-sm">${m.createdAt ? new Date(m.createdAt).toLocaleDateString() : '—'}</td>
-                  <td><button class="btn btn-danger btn-sm" onclick="ownerDeleteMinistry('${esc(m.id)}','${esc(m.name)}')">Delete</button></td>
-                </tr>
-              `).join('')}
-            </tbody>
-          </table>
-        </div>
-      `;
-    } catch(e) { container.innerHTML = `<p style="color:var(--red)">Error: ${esc(e.message)}</p>`; }
-  };
+      const res = await apiFetch('/api/sheet/read');
+      if (res.ok) {
+        const roster = await res.json();
+        STATE.roster = roster;
+        STATE.canEdit = true; // assume editable if already logged in
+        enterApp({ email: '', readonly: false });
+        // Skip loadRoster since we already have data
+        els.rosterLoader.classList.add('hidden');
+        renderRoster();
+        els.loader.classList.add('hidden');
+        return;
+      }
+    } catch (_) {
+      // Not logged in — show login gate
+    }
 
-  window.ownerDeleteMinistry = async function(id, name) {
-    if (!confirm(`Delete ministry "${name}"? This cannot be undone.`)) return;
-    const secret = document.getElementById('owner-secret')?.value;
-    const res = await fetch(`/api/owner/ministry/${id}`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${secret}` } });
-    const data = await res.json();
-    if (data.success) { toast(`Deleted (${data.deleted} keys)`, 'success'); loadOwnerData(); }
-    else toast(data.error || 'Failed', 'error');
-  };
-
-  // Auto-load if secret is already set
-  if (sessionStorage.getItem('ownerSecret')) loadOwnerData();
-}
-
-// ═══════════════════════════════════════════════════════════════
-// SETTINGS (extended — Phase 7)
-// ═══════════════════════════════════════════════════════════════
-
-async function renderSettings() {
-  mount(appShell(`<div class="loading-state"><div class="spinner"></div></div>`, 'settings'));
-  const orgId = state.user?.orgId || 'default';
-  const data = await api('GET', `settings/public?orgId=${encodeURIComponent(orgId)}`);
-  const s    = data;
-  const prefs = state.user?.preferences || {};
-
-  document.getElementById('main-content').innerHTML = `
-    <div class="page">
-      <h1>Settings</h1>
-      ${state.isDemoMode ? `<div class="demo-banner mt-2 mb-3" style="border-radius:var(--radius)">Settings are read-only in demo mode.</div>` : ''}
-
-      <!-- Profile -->
-      <div class="card mb-3">
-        <div class="card-header"><h3>Profile</h3></div>
-        <div class="card-body">
-          <div style="display:flex;align-items:center;gap:1rem;margin-bottom:1rem">
-            <div class="student-detail-avatar" style="width:64px;height:64px;cursor:pointer;position:relative" onclick="${state.isDemoMode?'':'triggerLeaderPhotoUpload()'}">
-              ${state.user?.photoUrl ? `<img src="${esc(state.user.photoUrl)}" alt="">` : `<span>${(state.user?.name||'?').charAt(0).toUpperCase()}</span>`}
-              ${!state.isDemoMode ? `<div style="position:absolute;bottom:-2px;right:-2px;background:var(--primary);color:#fff;border-radius:50%;width:20px;height:20px;display:flex;align-items:center;justify-content:center;font-size:.6rem">📷</div>` : ''}
-            </div>
-            <div>
-              <div class="font-bold">${esc(state.user?.name||'')}</div>
-              <div class="text-sm text-muted">${esc(state.user?.email||'')}</div>
-            </div>
-          </div>
-          <input type="file" id="leader-photo-file" accept="image/*" class="hidden" onchange="handleLeaderPhotoUpload(event)">
-          ${!state.isDemoMode ? `
-            <form class="form-stack" id="profile-form" onsubmit="saveProfile(event)">
-              <div class="form-group">
-                <label class="form-label">Display name</label>
-                <input class="form-input" name="name" value="${esc(state.user?.name||'')}">
-              </div>
-              <div class="form-group">
-                <label class="form-label">Leader since</label>
-                <input class="form-input" name="leaderSince" value="${esc(state.user?.leaderSince||'')}" placeholder="2021">
-              </div>
-              <div class="form-group">
-                <label class="form-label">Fun fact</label>
-                <input class="form-input" name="funFact" value="${esc(state.user?.funFact||'')}" placeholder="Something fun about you">
-              </div>
-              <button class="btn btn-primary btn-sm" type="submit" style="align-self:flex-start">Save Profile</button>
-            </form>
-          ` : ''}
-        </div>
-      </div>
-
-      <!-- Appearance -->
-      <div class="card mb-3">
-        <div class="card-header"><h3>Appearance</h3></div>
-        <div class="card-body">
-          <form class="form-stack" id="appearance-form" onsubmit="saveAppearance(event)">
-            <div class="form-group">
-              <label class="form-label">Theme</label>
-              <select class="form-input form-select" name="theme" ${state.isDemoMode?'disabled':''}>
-                <option value="auto" ${(prefs.theme||'auto')==='auto'?'selected':''}>Auto (system)</option>
-                <option value="light" ${prefs.theme==='light'?'selected':''}>Light</option>
-                <option value="dark" ${prefs.theme==='dark'?'selected':''}>Dark</option>
-              </select>
-            </div>
-            <label style="display:flex;align-items:center;gap:.5rem;font-size:.9rem;cursor:pointer">
-              <input type="checkbox" name="compactMode" ${prefs.compactMode?'checked':''} ${state.isDemoMode?'disabled':''}>
-              Compact mode (reduced spacing)
-            </label>
-            <label style="display:flex;align-items:center;gap:.5rem;font-size:.9rem;cursor:pointer">
-              <input type="checkbox" name="stickyBottomNav" ${prefs.stickyBottomNav===false?'':'checked'} ${state.isDemoMode?'disabled':''}>
-              Sticky bottom navigation
-            </label>
-            ${!state.isDemoMode ? `<button class="btn btn-primary btn-sm" type="submit" style="align-self:flex-start">Save Appearance</button>` : ''}
-          </form>
-        </div>
-      </div>
-
-      <!-- Organization -->
-      <div class="card mb-3">
-        <div class="card-header"><h3>Organization</h3></div>
-        <div class="card-body">
-          <form class="form-stack" id="org-form" onsubmit="saveOrgSettings(event)">
-            <div class="form-group">
-              <label class="form-label">Ministry name</label>
-              <input class="form-input" name="ministryName" value="${esc(s.ministryName||'')}" ${state.isDemoMode ? 'readonly' : ''}>
-            </div>
-            <div class="form-group">
-              <label class="form-label">Campus</label>
-              <input class="form-input" name="campus" value="${esc(s.campus||'')}" ${state.isDemoMode ? 'readonly' : ''}>
-            </div>
-            <div class="form-group">
-              <label class="form-label">Inactivity threshold (days)</label>
-              <input class="form-input" type="number" name="inactivityDays" value="${s.inactivityDays ?? 90}" min="7" max="365" ${state.isDemoMode ? 'readonly' : ''}>
-            </div>
-            ${!state.isDemoMode ? `<button class="btn btn-primary btn-sm" type="submit" style="align-self:flex-start">Save</button>` : ''}
-          </form>
-        </div>
-      </div>
-
-      <!-- Security -->
-      <div class="card mb-3">
-        <div class="card-header"><h3>Security</h3></div>
-        <div class="card-body">
-          ${!state.isDemoMode ? `
-            <form class="form-stack" id="pw-form" onsubmit="changePassword(event)">
-              <div class="form-group">
-                <label class="form-label">Current password</label>
-                <input class="form-input" type="password" name="oldPassword">
-              </div>
-              <div class="form-group">
-                <label class="form-label">New password</label>
-                <input class="form-input" type="password" name="newPassword" placeholder="10+ chars">
-              </div>
-              <div class="form-group">
-                <label class="form-label">Confirm new password</label>
-                <input class="form-input" type="password" name="confirmPassword">
-              </div>
-              <div id="pw-msg" class="hidden form-error"></div>
-              <button class="btn btn-secondary btn-sm" type="submit" style="align-self:flex-start">Change password</button>
-            </form>
-          ` : `<p class="text-sm text-muted">Account security settings available after login.</p>`}
-        </div>
-      </div>
-
-      ${!state.isDemoMode ? `
-        <div class="card">
-          <div class="card-header"><h3 style="color:var(--red)">Danger Zone</h3></div>
-          <div class="card-body">
-            <button class="btn btn-danger btn-sm" onclick="doLogout()">Log out of all devices</button>
-          </div>
-        </div>
-      ` : ''}
-    </div>
-  `;
-
-  window.saveProfile = async function(e) {
-    e.preventDefault();
-    const fd = new FormData(e.target);
-    const updates = { name: fd.get('name'), leaderSince: fd.get('leaderSince'), funFact: fd.get('funFact') };
-    const data = await api('POST', 'profile/update', updates);
-    if (data.success) {
-      state.user = { ...state.user, ...updates };
-      toast('Profile saved', 'success');
-    } else toast(data.error || 'Failed', 'error');
-  };
-
-  window.saveAppearance = async function(e) {
-    e.preventDefault();
-    const fd = new FormData(e.target);
-    const prefs = {
-      theme: fd.get('theme') || 'auto',
-      compactMode: fd.get('compactMode') === 'on',
-      stickyBottomNav: fd.get('stickyBottomNav') === 'on',
-    };
-    const data = await api('POST', 'profile/update', { preferences: prefs });
-    if (data.success) {
-      state.user = { ...state.user, preferences: prefs };
-      applyTheme(prefs);
-      toast('Appearance saved', 'success');
-    } else toast(data.error || 'Failed', 'error');
-  };
-
-  window.saveOrgSettings = async function(e) {
-    e.preventDefault();
-    if (demoBlock()) return;
-    const fd = new FormData(e.target);
-    await api('POST', 'settings', { ministryName: fd.get('ministryName'), campus: fd.get('campus'), inactivityDays: Number(fd.get('inactivityDays')) });
-    state.settings = null; // invalidate cache
-    toast('Settings saved', 'success');
-  };
-
-  window.changePassword = async function(e) {
-    e.preventDefault();
-    const fd  = new FormData(e.target);
-    const msg = document.getElementById('pw-msg');
-    const data = await api('POST', 'auth/change-password', { oldPassword: fd.get('oldPassword'), newPassword: fd.get('newPassword'), confirmPassword: fd.get('confirmPassword') });
-    if (data.success) { toast('Password changed', 'success'); e.target.reset(); }
-    else { msg.textContent = data.error; msg.classList.remove('hidden'); }
-  };
-
-  window.triggerLeaderPhotoUpload = function() { document.getElementById('leader-photo-file')?.click(); };
-
-  window.handleLeaderPhotoUpload = async function(e) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    openCropModal(file, async blob => {
-      const form = new FormData();
-      form.append('file', blob, 'photo.jpg');
-      try {
-        const res = await fetch('/api/upload-photo?type=leader', { method:'POST', credentials:'include', body:form });
-        const data = await res.json();
-        if (data.url) {
-          await api('POST', 'profile/update', { photoUrl: data.url });
-          state.user = { ...state.user, photoUrl: data.url };
-          toast('Photo updated', 'success');
-          renderSettings();
-        }
-      } catch(_) { toast('Upload failed', 'error'); }
-    });
-  };
-}
-
-// ═══════════════════════════════════════════════════════════════
-// BOOT
-// ═══════════════════════════════════════════════════════════════
-
-(async function boot() {
-  const path = getRoute();
-  const publicPaths = ['/login', '/signup', '/forgot-password', '/reset-password', '/demo'];
-  if (!publicPaths.some(p => path.startsWith(p))) {
-    await loadUser();
+    els.loader.classList.add('hidden');
+    els.loginGate.classList.remove('hidden');
+  } else {
+    els.loader.classList.add('hidden');
   }
-  render();
-})();
+}
+
+// Start
+init().catch(err => {
+  console.error('[StoryTrackr] Init error:', err);
+  els.loader.classList.add('hidden');
+  els.loginGate.classList.remove('hidden');
+  showToast('App failed to initialise. Please refresh.', 'error');
+});
