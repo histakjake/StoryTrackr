@@ -585,12 +585,22 @@ export async function routeRequest(req, res, env) {
   // Common headers
   res.setHeader('Content-Type', 'application/json');
 
-  const supabase = getSupabase(env);
-  const clientIp = req.headers?.['x-forwarded-for']?.split(',')[0].trim()
-                ?? req.socket?.remoteAddress
-                ?? 'unknown';
-
   try {
+    const supabase = getSupabase(env);
+    const clientIp = req.headers?.['x-forwarded-for']?.split(',')[0].trim()
+                  ?? req.socket?.remoteAddress
+                  ?? 'unknown';
+
+    // ── Health ────────────────────────────────────────────────────────────
+    if (pathname === '/api/health' && method === 'GET') {
+      return json(res, 200, {
+        ok: true,
+        supabaseUrl: env.SUPABASE_URL ? 'set' : 'MISSING',
+        supabaseKey: env.SUPABASE_SERVICE_KEY ? 'set' : 'MISSING',
+        nodeEnv: env.NODE_ENV,
+      });
+    }
+
     // ── Auth ──────────────────────────────────────────────────────────────
     if (pathname === '/api/auth/login' && method === 'POST') {
       return await handleLogin(req, res, supabase);

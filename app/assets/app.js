@@ -41,6 +41,10 @@ const $ = id => document.getElementById(id);
 
 const els = {
   loader:           $('loader'),
+  bootError:        $('boot-error'),
+  bootErrorMsg:     $('boot-error-msg'),
+  bootDebug:        $('boot-debug'),
+  bootRetryBtn:     $('boot-retry-btn'),
   loginGate:        $('login-gate'),
   app:              $('app'),
 
@@ -108,12 +112,18 @@ function showToast(message, type = 'info') {
 // ── API helpers ───────────────────────────────────────────────────────────
 
 async function apiFetch(url, options = {}) {
-  const res = await fetch(url, {
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json', ...(options.headers ?? {}) },
-    ...options,
-  });
-  return res;
+  const controller = new AbortController();
+  const tid = setTimeout(() => controller.abort(), 10_000);
+  try {
+    return await fetch(url, {
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json', ...(options.headers ?? {}) },
+      signal: controller.signal,
+      ...options,
+    });
+  } finally {
+    clearTimeout(tid);
+  }
 }
 
 // ── Auth ──────────────────────────────────────────────────────────────────
@@ -667,8 +677,22 @@ async function init() {
         els.loader.classList.add('hidden');
         return;
       }
-    } catch (_) {
-      // Not logged in — show login gate
+      // non-200 (e.g. 401) → fall through to show login gate
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        // Timeout — show visible error instead of silent spinner
+        els.loader.classList.add('hidden');
+        els.bootErrorMsg.textContent = 'The server didn\'t respond within 10 s. Is it running?';
+        els.bootDebug.textContent = `Endpoint: /api/sheet/read\nError: timeout`;
+        els.bootError.classList.remove('hidden');
+        els.bootRetryBtn.addEventListener('click', () => {
+          els.bootError.classList.add('hidden');
+          els.loader.classList.remove('hidden');
+          init();
+        }, { once: true });
+        return;
+      }
+      // network error — fall through to show login gate
     }
 
     els.loader.classList.add('hidden');
